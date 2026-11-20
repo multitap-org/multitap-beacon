@@ -262,7 +262,7 @@ int main()
     reg.nonce = 2;
     peer_send(&host, net.primary_port, &reg);
     server_pump(&net, &server);
-    check(peer_receive(&host, 1000, &r) && r.type == BeaconType::REGISTERED && r.id_count == 2,
+    check(peer_receive(&host, 1000, &r) && r.type == BeaconType::REGISTERED_REPLY && r.id_count == 2,
           "REGISTER with the cookie: REGISTERED, 2 ids");
 
     // The client meets: both get each other's address.

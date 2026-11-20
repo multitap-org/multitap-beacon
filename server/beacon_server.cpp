@@ -427,7 +427,7 @@ static void handle_register(BeaconServer* server, uint64_t now_ms, const BeaconA
         server->stats.ids_refused_full += request->id_count;
     }
     server->stats.ids_accepted += accepted;
-    reply.type = BeaconType::REGISTERED;
+    reply.type = BeaconType::REGISTERED_REPLY;
     reply.id_count = accepted;
     reply.ttl_seconds = BEACON_ENTRY_TTL_SECONDS;
     cookie_compute(server, from, server->epoch, reply.cookie);

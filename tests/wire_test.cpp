@@ -88,7 +88,7 @@ static uint32_t sample_messages(BeaconMessage* out)
     out[n++] = m;
 
     m = BeaconMessage{};
-    m.type = BeaconType::REGISTERED;
+    m.type = BeaconType::REGISTERED_REPLY;
     m.nonce = 8;
     m.cookie[3] = 9;
     m.id_count = 0;
@@ -251,7 +251,7 @@ static void test_padding_rejects()
                 zero_from = 33;
                 zero_to = 36;
                 break;
-            case BeaconType::REGISTERED:
+            case BeaconType::REGISTERED_REPLY:
                 zero_from = 33;
                 zero_to = 34;
                 break;
@@ -315,7 +315,7 @@ static void test_field_rejects()
     check(beacon_encode(&reg, packet, sizeof(packet)) == 0, "encode refuses a zero id within count");
 
     BeaconMessage registered = {};
-    registered.type = BeaconType::REGISTERED;
+    registered.type = BeaconType::REGISTERED_REPLY;
     registered.id_count = 8;
     size = beacon_encode(&registered, packet, sizeof(packet));
     check(size == BEACON_SIZE_REGISTERED, "REGISTERED accepted 8 encodes");

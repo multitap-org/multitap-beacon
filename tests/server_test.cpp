@@ -130,7 +130,7 @@ static int32_t register_ids(Fixture* f, const BeaconAddress* host, uint32_t firs
     }
     m = make_register(2, r.cookie, first_id, count);
     send_message(f, BeaconSocket::PRIMARY, host, &m);
-    if (!reply(f, 0, &r) || r.type != BeaconType::REGISTERED || r.nonce != 2)
+    if (!reply(f, 0, &r) || r.type != BeaconType::REGISTERED_REPLY || r.nonce != 2)
     {
         return -1;
     }
@@ -193,14 +193,14 @@ static void test_register_and_meet()
     // With the cookie: stored.
     m = make_register(8, cookie, 100, 2);
     send_message(&f, BeaconSocket::PRIMARY, &host, &m);
-    check(reply(&f, 0, &r) && r.type == BeaconType::REGISTERED, "REGISTER with the cookie is REGISTERED");
+    check(reply(&f, 0, &r) && r.type == BeaconType::REGISTERED_REPLY, "REGISTER with the cookie is REGISTERED");
     check(r.id_count == 2 && r.ttl_seconds == BEACON_ENTRY_TTL_SECONDS && r.nonce == 8, "REGISTERED fields");
     check(f.server.stats.entries == 2, "two entries stored");
 
     // The fresh cookie from REGISTERED works for the next refresh.
     m = make_register(9, r.cookie, 100, 2);
     send_message(&f, BeaconSocket::PRIMARY, &host, &m);
-    check(reply(&f, 0, &r) && r.type == BeaconType::REGISTERED && r.id_count == 2,
+    check(reply(&f, 0, &r) && r.type == BeaconType::REGISTERED_REPLY && r.id_count == 2,
           "the fresh cookie works and refreshing doesn't add entries");
     check(f.server.stats.entries == 2, "still two entries");
 
@@ -288,7 +288,7 @@ static void test_expiry_and_cookie_age()
     // The cookie from 61 s ago (epoch before last at most... one epoch back) still works.
     BeaconMessage reg = make_register(3, cookie, 10, 4);
     send_message(&f, BeaconSocket::PRIMARY, &host, &reg);
-    check(reply(&f, 0, &r) && r.type == BeaconType::REGISTERED && r.id_count == 4,
+    check(reply(&f, 0, &r) && r.type == BeaconType::REGISTERED_REPLY && r.id_count == 4,
           "a 61 s old cookie still works, and expired entries no longer count against the source");
 
     // 121 s later without using the fresh one: refused.

@@ -121,7 +121,7 @@ uint32_t beacon_message_size(uint8_t type)
             return BEACON_SIZE_REGISTER;
         case static_cast<uint8_t>(BeaconType::COOKIE):
             return BEACON_SIZE_COOKIE;
-        case static_cast<uint8_t>(BeaconType::REGISTERED):
+        case static_cast<uint8_t>(BeaconType::REGISTERED_REPLY):
             return BEACON_SIZE_REGISTERED;
         case static_cast<uint8_t>(BeaconType::MEET):
             return BEACON_SIZE_MEET;
@@ -288,7 +288,7 @@ bool beacon_decode(const uint8_t* data, size_t size, BeaconMessage* out)
         case BeaconType::COOKIE:
             ok = decode_cookie(data, out);
             break;
-        case BeaconType::REGISTERED:
+        case BeaconType::REGISTERED_REPLY:
             ok = decode_registered(data, out);
             break;
         case BeaconType::MEET:
@@ -335,7 +335,7 @@ static bool message_valid(const BeaconMessage* m)
                 }
             }
             return true;
-        case BeaconType::REGISTERED:
+        case BeaconType::REGISTERED_REPLY:
             return m->id_count <= BEACON_MAX_IDS;
         case BeaconType::MEET:
         case BeaconType::NOT_FOUND:
@@ -377,7 +377,7 @@ uint32_t beacon_encode(const BeaconMessage* message, uint8_t* out, size_t capaci
         case BeaconType::COOKIE:
             memcpy(out + OFFSET_AFTER_NONCE, message->cookie, BEACON_COOKIE_SIZE);
             break;
-        case BeaconType::REGISTERED:
+        case BeaconType::REGISTERED_REPLY:
             memcpy(out + OFFSET_AFTER_NONCE, message->cookie, BEACON_COOKIE_SIZE);
             out[OFFSET_REGISTERED_ACCEPTED] = message->id_count;
             write_u16(out + OFFSET_REGISTERED_TTL, message->ttl_seconds);

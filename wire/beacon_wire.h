@@ -47,7 +47,7 @@ enum class BeaconType : uint8_t
     BOUND = 2,
     REGISTER = 3,
     COOKIE = 4,
-    REGISTERED = 5,
+    REGISTERED_REPLY = 5,   // REGISTERED in PROTOCOL.md (Windows headers define REGISTERED)
     MEET = 6,
     INTRO = 7,
     NOT_FOUND = 8,
