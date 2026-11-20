@@ -7,6 +7,7 @@
 #include "beacon_net.h"
 #include "beacon_server.h"
 
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cinttypes>
 #include <csignal>
@@ -52,6 +53,9 @@ static void print_usage(FILE* out)
             "  --rate N                  packets per second per source (default %" PRIu32 ")\n"
             "  --burst N                 packets a source may send at once (default %" PRIu32 ")\n"
             "  --overflow-rate N         packets per second shared by sources that don't fit (default %" PRIu32 ")\n"
+            "  --public-address IP       the server's public IPv4 or IPv6 address, for a server behind a NAT\n"
+            "                            with port forwarding: senders from private addresses are reported\n"
+            "                            with it (give it twice for both families; default: off)\n"
             "  --stats-interval SECONDS  log counts this often, 0 = never (default 60)\n"
             "  --log-level LEVEL         error, warning, info or debug (default info)\n"
             "  --version                 print the version\n"
@@ -79,6 +83,48 @@ static bool parse_number(const char* name, const char* text, uint32_t min, uint3
     }
     *out = static_cast<uint32_t>(value);
     return true;
+}
+
+// --public-address: a numeric IPv4 address (stored as ::ffff:a.b.c.d) or IPv6 address.
+static bool parse_public_address(const char* text, BeaconServerConfig* config)
+{
+    in_addr ip4 = {};
+    in6_addr ip6 = {};
+    if (inet_pton(AF_INET, text, &ip4) == 1)
+    {
+        BeaconAddress address = {};
+        address.ip[10] = 0xff;
+        address.ip[11] = 0xff;
+        memcpy(address.ip + 12, &ip4, 4);
+        if (config->has_public_ipv4)
+        {
+            fprintf(stderr, "beacon: --public-address given twice for IPv4\n");
+            return false;
+        }
+        config->has_public_ipv4 = true;
+        config->public_ipv4 = address;
+        return true;
+    }
+    if (inet_pton(AF_INET6, text, &ip6) == 1)
+    {
+        BeaconAddress address = {};
+        memcpy(address.ip, &ip6, 16);
+        if (beacon_address_is_ipv4(&address))
+        {
+            fprintf(stderr, "beacon: give --public-address an IPv4 address as a.b.c.d\n");
+            return false;
+        }
+        if (config->has_public_ipv6)
+        {
+            fprintf(stderr, "beacon: --public-address given twice for IPv6\n");
+            return false;
+        }
+        config->has_public_ipv6 = true;
+        config->public_ipv6 = address;
+        return true;
+    }
+    fprintf(stderr, "beacon: --public-address needs a numeric IPv4 or IPv6 address\n");
+    return false;
 }
 
 // Returns 0 to run, 1 for an error, 2 when --help or --version was answered.
@@ -163,6 +209,13 @@ static int parse_options(int argc, char** argv, Options* options)
         else if (strcmp(name, "--overflow-rate") == 0)
         {
             if (!parse_number(name, value, 1, 1000000, &options->config.overflow_rate_per_second))
+            {
+                return 1;
+            }
+        }
+        else if (strcmp(name, "--public-address") == 0)
+        {
+            if (!parse_public_address(value, &options->config))
             {
                 return 1;
             }
@@ -328,6 +381,10 @@ int main(int argc, char** argv)
                    net.secondary_fd >= 0 ? " and secondary port" : ", no secondary port",
                    net.primary_family == AF_INET ? " (IPv4 only)" : "", beacon_server_table_bytes(&server) / 1024,
                    options.config.max_entries, options.config.max_sources);
+    if (options.config.has_public_ipv4 || options.config.has_public_ipv6)
+    {
+        beacon_log(BeaconLogLevel::info, "public address set: senders from private addresses are reported with it");
+    }
     if (net.secondary_fd >= 0)
     {
         beacon_log(BeaconLogLevel::info, "secondary port: UDP %u", static_cast<unsigned>(net.secondary_port));

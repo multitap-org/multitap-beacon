@@ -45,7 +45,7 @@ to amplify attacks).
 ## Self-hosting in a few minutes
 
 Any Linux machine with a public IP works (a small VPS is plenty: the default
-tables take 11 MiB of memory). Open **UDP 55430 and 55431** in your firewall,
+tables take 13 MiB of memory). Open **UDP 55430 and 55431** in your firewall,
 on IPv4 and IPv6 if you have it. Then pick one of these.
 
 ### Build and run directly
@@ -94,6 +94,31 @@ server, `your.host.name` (port 55430 unless you changed it). Give your server a 
 AAAA records if it has IPv6: hosts register over both, so clients on either
 find them.
 
+### Behind a NAT (port forwarding)
+
+The server doesn't need a public IP on its own interface: a router or
+firewall that forwards UDP 55430 and 55431 to it (plain DNAT, which keeps the
+senders' addresses) works. Point the DNS name at the router's public IP.
+
+One case needs help: devices on the server's own network reach it through the
+router's NAT loopback, so the server sees their private address and can't
+learn their public one. Tell it the public address:
+
+```sh
+beacon --public-address 203.0.113.10
+```
+
+Senders from private addresses (10/8, 172.16/12, 192.168/16, 100.64/10,
+loopback, link-local; IPv6 ULA and link-local) are then reported with that
+address and their own port. That's right when the router keeps source ports
+on the way out, which Linux-based routers (OpenWrt, most home routers) and
+MikroTik do; pfSense and OPNsense change them unless "static port" is set in
+their outbound NAT. Devices outside the network don't need any of this.
+
+The router's public IP must be a real one: behind carrier-grade NAT (a WAN
+address in 100.64/10 or another private range) nothing outside can reach the
+server; use a VPS then.
+
 ## Ports and firewall
 
 | port | protocol | what |
@@ -118,6 +143,8 @@ symmetric NAT early.
 --rate N                  packets per second per source (default 20)
 --burst N                 packets a source may send at once (default 60)
 --overflow-rate N         packets per second shared by sources that don't fit (default 1000)
+--public-address IP       the server's public IPv4 or IPv6 address, for a server behind a NAT
+                          with port forwarding (give it twice for both families; default: off)
 --stats-interval SECONDS  log counts this often, 0 = never (default 60)
 --log-level LEVEL         error, warning, info or debug (default info)
 ```
@@ -133,8 +160,8 @@ All memory is allocated at startup; nothing is allocated per packet.
 
 | tables | memory |
 |---|---|
-| default (65536 ids, 65536 sources) | 11 MiB (RSS about 15 MiB) |
-| 1M ids, 1M sources | 176 MiB |
+| default (65536 ids, 65536 sources) | 13 MiB (RSS about 17 MiB) |
+| 1M ids, 1M sources | 208 MiB |
 
 Measured on an RK3588 (one Cortex-A76 core, Release build): the logic alone
 handles about 370,000 BIND, 255,000 MEET or 75,000 REGISTER (8 ids) packets

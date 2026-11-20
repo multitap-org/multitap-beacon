@@ -48,6 +48,41 @@ static void source_key(const BeaconAddress* address, uint8_t key[16])
     }
 }
 
+// A sender on the server's own side of a NAT (see --public-address).
+static bool address_is_private(const BeaconAddress* address)
+{
+    const uint8_t* ip = address->ip;
+    if (beacon_address_is_ipv4(address))
+    {
+        const uint8_t* v4 = ip + 12;
+        return v4[0] == 10 || v4[0] == 127 || (v4[0] == 172 && (v4[1] & 0xf0) == 16) ||
+               (v4[0] == 192 && v4[1] == 168) || (v4[0] == 100 && (v4[1] & 0xc0) == 64) ||
+               (v4[0] == 169 && v4[1] == 254);
+    }
+    static constexpr uint8_t LOOPBACK[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    return (ip[0] & 0xfe) == 0xfc || (ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80) || memcmp(ip, LOOPBACK, 16) == 0;
+}
+
+// The address the server tells others for `from`: `from` itself, or the
+// configured public address with from's port for a private sender.
+static BeaconAddress reported_address(const BeaconServer* server, const BeaconAddress* from)
+{
+    BeaconAddress reported = *from;
+    if (!address_is_private(from))
+    {
+        return reported;
+    }
+    if (beacon_address_is_ipv4(from) && server->config.has_public_ipv4)
+    {
+        memcpy(reported.ip, server->config.public_ipv4.ip, 16);
+    }
+    else if (!beacon_address_is_ipv4(from) && server->config.has_public_ipv6)
+    {
+        memcpy(reported.ip, server->config.public_ipv6.ip, 16);
+    }
+    return reported;
+}
+
 // ---------------------------------------------------------------------------
 // Cookies
 // ---------------------------------------------------------------------------
@@ -221,7 +256,7 @@ static uint32_t entry_home(const BeaconServer* server, const BeaconId* id, uint8
 
 static void entry_free(BeaconServer* server, BeaconEntry* entry)
 {
-    source_release_entry(server, &entry->address);
+    source_release_entry(server, &entry->reply_to);
     *entry = BeaconEntry{};
     server->stats.entries--;
     server->stats.expired++;
@@ -279,12 +314,12 @@ static bool entry_register(BeaconServer* server, uint64_t now_ms, const BeaconId
     if (slot != NO_SLOT)
     {
         BeaconEntry* entry = &server->entries[slot];
-        if (!beacon_address_equal(&entry->address, from))
+        if (!beacon_address_equal(&entry->reply_to, from))
         {
             // The host's NAT gave it a new address (or it moved): the entry
             // moves to it, and to its source if that's another one.
             uint8_t old_key[16];
-            source_key(&entry->address, old_key);
+            source_key(&entry->reply_to, old_key);
             if (memcmp(old_key, owner->key, 16) != 0)
             {
                 if (owner->entries >= server->config.max_ids_per_source)
@@ -292,10 +327,11 @@ static bool entry_register(BeaconServer* server, uint64_t now_ms, const BeaconId
                     server->stats.ids_refused_source++;
                     return false;
                 }
-                source_release_entry(server, &entry->address);
+                source_release_entry(server, &entry->reply_to);
                 owner->entries++;
             }
-            entry->address = *from;
+            entry->reply_to = *from;
+            entry->address = reported_address(server, from);
         }
         entry->expires_ms = expires;
         return true;
@@ -314,7 +350,8 @@ static bool entry_register(BeaconServer* server, uint64_t now_ms, const BeaconId
     BeaconEntry* entry = &server->entries[free_slot];
     *entry = BeaconEntry{};
     entry->id = *id;
-    entry->address = *from;
+    entry->address = reported_address(server, from);
+    entry->reply_to = *from;
     entry->used = 1;
     entry->ipv4 = ipv4;
     entry->expires_ms = expires;
@@ -352,7 +389,7 @@ static void handle_bind(BeaconServer* server, BeaconSocket socket, const BeaconA
     BeaconMessage reply = {};
     reply.type = BeaconType::BOUND;
     reply.nonce = request->nonce;
-    reply.address = *from;
+    reply.address = reported_address(server, from);
     outbox_add(out, socket, from, &reply);
 }
 
@@ -434,8 +471,8 @@ static void handle_meet(BeaconServer* server, uint64_t now_ms, const BeaconAddre
     outbox_add(out, BeaconSocket::PRIMARY, from, &reply);
     // The host proved with its cookie that it receives at this address, so
     // this second packet can't be aimed at a third party.
-    reply.address = *from;
-    outbox_add(out, BeaconSocket::PRIMARY, &entry->address, &reply);
+    reply.address = reported_address(server, from);
+    outbox_add(out, BeaconSocket::PRIMARY, &entry->reply_to, &reply);
 }
 
 void beacon_server_receive(BeaconServer* server, uint64_t now_ms, BeaconSocket socket,

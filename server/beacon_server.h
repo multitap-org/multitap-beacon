@@ -41,6 +41,17 @@ struct BeaconServerConfig
     uint32_t rate_per_second = 20;         // packets per source
     uint32_t burst = 60;
     uint32_t overflow_rate_per_second = 1000;  // shared by the sources that don't fit the table
+    // --public-address: for a server behind a NAT with port forwarding. A
+    // sender with a private address (RFC 1918, CGNAT 100.64/10, loopback,
+    // link-local; IPv6 ULA, link-local, loopback) is on the server's own side
+    // of that NAT, so the server never sees its public address: it reports
+    // this one with the sender's port instead (right when the router keeps
+    // source ports, which most Linux-based ones do). Replies still go to the
+    // sender's real address. Only `ip` is used.
+    bool has_public_ipv4 = false;
+    BeaconAddress public_ipv4 = {};
+    bool has_public_ipv6 = false;
+    BeaconAddress public_ipv6 = {};
 };
 
 enum class BeaconSocket : uint8_t
@@ -92,7 +103,8 @@ struct BeaconStats
 struct BeaconEntry
 {
     BeaconId id = {};
-    BeaconAddress address = {};
+    BeaconAddress address = {};     // what clients are told (the --public-address one for a private sender)
+    BeaconAddress reply_to = {};    // where the host really is: INTROs go here, its source owns the entry
     uint8_t used = 0;
     uint8_t ipv4 = 0;               // part of the key: one entry per id and family
     uint64_t expires_ms = 0;

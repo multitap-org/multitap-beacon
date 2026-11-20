@@ -431,6 +431,95 @@ static void test_families_and_rebinding()
     beacon_server_destroy(&f.server);
 }
 
+static void test_public_address()
+{
+    Fixture f;
+    BeaconServerConfig config = {};
+    config.has_public_ipv4 = true;
+    config.public_ipv4 = ipv4(203, 0, 113, 200, 0);
+    config.has_public_ipv6 = true;
+    config.public_ipv6 = ipv6(1, 0xff, 0);
+    check(fixture_create(&f, &config), "server creates");
+
+    BeaconMessage bind = {};
+    bind.type = BeaconType::BIND;
+    BeaconMessage r;
+
+    // Private senders are reported with the public address and their own port;
+    // the reply still goes to their real address.
+    BeaconAddress lan = ipv4(192, 168, 1, 5, 41000);
+    send_message(&f, BeaconSocket::PRIMARY, &lan, &bind);
+    BeaconAddress expected = ipv4(203, 0, 113, 200, 41000);
+    check(reply(&f, 0, &r) && beacon_address_equal(&r.address, &expected), "192.168/16 is reported as public");
+    check(beacon_address_equal(&f.out.packets[0].to, &lan), "the BOUND goes to the real address");
+
+    BeaconAddress privates[] = {ipv4(10, 1, 2, 3, 1000), ipv4(172, 20, 0, 1, 1000), ipv4(100, 64, 9, 9, 1000),
+                                ipv4(127, 0, 0, 1, 1000), ipv4(169, 254, 1, 1, 1000)};
+    for (uint32_t i = 0; i < 5; i++)
+    {
+        send_message(&f, BeaconSocket::PRIMARY, &privates[i], &bind);
+        expected = ipv4(203, 0, 113, 200, 1000);
+        check(reply(&f, 0, &r) && beacon_address_equal(&r.address, &expected), "private IPv4 ranges are replaced");
+    }
+    BeaconAddress publics[] = {ipv4(172, 32, 0, 1, 1000), ipv4(100, 128, 0, 1, 1000), ipv4(198, 51, 100, 1, 1000),
+                               ipv4(11, 0, 0, 1, 1000)};
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        send_message(&f, BeaconSocket::PRIMARY, &publics[i], &bind);
+        check(reply(&f, 0, &r) && beacon_address_equal(&r.address, &publics[i]), "public IPv4 addresses are kept");
+    }
+
+    BeaconAddress ula = {};
+    ula.ip[0] = 0xfd;
+    ula.ip[15] = 5;
+    ula.port = 2000;
+    send_message(&f, BeaconSocket::PRIMARY, &ula, &bind);
+    expected = ipv6(1, 0xff, 2000);
+    check(reply(&f, 0, &r) && beacon_address_equal(&r.address, &expected), "an IPv6 ULA is reported as public IPv6");
+    BeaconAddress global6 = ipv6(7, 3, 2000);
+    send_message(&f, BeaconSocket::PRIMARY, &global6, &bind);
+    check(reply(&f, 0, &r) && beacon_address_equal(&r.address, &global6), "a global IPv6 address is kept");
+
+    // A host on the server's LAN, a client outside.
+    BeaconAddress host = ipv4(10, 0, 0, 7, 40000);
+    BeaconAddress client = ipv4(198, 51, 100, 9, 50000);
+    check(register_ids(&f, &host, 700, 1, nullptr) == 1, "a LAN host registers");
+    BeaconMessage m = make_meet(1, 700);
+    send_message(&f, BeaconSocket::PRIMARY, &client, &m);
+    BeaconMessage to_client;
+    BeaconMessage to_host;
+    check(f.out.count == 2 && reply(&f, 0, &to_client) && reply(&f, 1, &to_host), "MEET gets two INTROs");
+    expected = ipv4(203, 0, 113, 200, 40000);
+    check(beacon_address_equal(&to_client.address, &expected), "the client is given the host's public address");
+    check(beacon_address_equal(&f.out.packets[1].to, &host), "the host's INTRO goes to its real address");
+    check(beacon_address_equal(&to_host.address, &client), "the host is given the client's address");
+
+    // A client on the LAN, the host outside: the host gets the public address.
+    BeaconAddress host2 = ipv4(198, 51, 100, 20, 40000);
+    BeaconAddress lan_client = ipv4(192, 168, 1, 30, 50001);
+    check(register_ids(&f, &host2, 800, 1, nullptr) == 1, "an outside host registers");
+    m = make_meet(2, 800);
+    send_message(&f, BeaconSocket::PRIMARY, &lan_client, &m);
+    check(f.out.count == 2 && reply(&f, 1, &to_host), "MEET from the LAN gets INTROs");
+    expected = ipv4(203, 0, 113, 200, 50001);
+    check(beacon_address_equal(&to_host.address, &expected), "the host is given the LAN client's public address");
+
+    // The LAN host's entry is owned by its real address: everything frees.
+    f.now += 61000;
+    beacon_server_tick(&f.server, f.now);
+    f.now += BEACON_SOURCE_IDLE_MS;
+    beacon_server_tick(&f.server, f.now);
+    check(f.server.stats.entries == 0 && f.server.stats.sources == 0, "entries and sources free with a public address");
+    beacon_server_destroy(&f.server);
+
+    // Without --public-address nothing is replaced.
+    BeaconServerConfig plain = {};
+    check(fixture_create(&f, &plain), "server creates");
+    send_message(&f, BeaconSocket::PRIMARY, &lan, &bind);
+    check(reply(&f, 0, &r) && beacon_address_equal(&r.address, &lan), "without the option a private address is kept");
+    beacon_server_destroy(&f.server);
+}
+
 static void test_bad_config()
 {
     BeaconServer server;
@@ -450,6 +539,7 @@ int main()
     test_limits();
     test_rate_limit();
     test_families_and_rebinding();
+    test_public_address();
     test_bad_config();
     if (g_failures != 0)
     {

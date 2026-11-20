@@ -112,7 +112,10 @@ REGISTERED's accepted is 0-8; every address has a non-zero port and zero padding
   libc + sockets (Linux; other POSIX / Windows later if cheap) + Monocypher (submodule) for the
   cookie and table hashing. Wire format in its own small library (`beacon_wire.h/.cpp`,
   no dependencies) that frontends-common will also use (submodule in piccolo's deps/).
-- Command line: ports, bind address, table sizes, per-source limits, log level. Logs counts,
+- Command line: ports, bind address, table sizes, per-source limits, log level, and
+  `--public-address` for a server behind a NAT with port forwarding: senders with private
+  addresses (its own LAN, through NAT loopback) are reported with that public IP and their
+  own port; replies still go to their real address. Nothing on the wire changes. Logs counts,
   never meeting ids or addresses.
 - Ships: README (self-hosting in 5 minutes), systemd unit, Dockerfile, tests (unit + a loopback
   end-to-end: two fake peers register/meet and get each other's address), a libFuzzer target for
