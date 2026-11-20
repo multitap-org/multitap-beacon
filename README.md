@@ -201,6 +201,7 @@ host `beacon-page`, port 80 (the containers must share a network with NPM).
 | 55430 | UDP | primary: address reflection, registration, introductions, STUN |
 | 55431 | UDP | secondary: address reflection only (NAT type detection), STUN |
 | 3478 | UDP | optional (`--stun-port 3478`): STUN only, the standard STUN port |
+| 55432 | TCP | WebSocket signaling for browsers, on 127.0.0.1 only: a TLS proxy (Caddy) in front serves it as wss:// |
 
 Nothing else, inbound or outbound. Browsers use `stun:your.host.name:55430`;
 open 3478 only if you want the standard port too. Without the secondary port
@@ -216,6 +217,10 @@ symmetric NAT early.
 --secondary-port N        secondary UDP port for NAT detection, 0 = off (default 55431)
 --stun-port N             an extra UDP port that answers STUN only, usually 3478; the primary
                           and secondary ports answer STUN anyway (default 0 = off)
+--signal-bind ADDRESS     numeric address for the WebSocket signaling listener (default 127.0.0.1:
+                          a TLS proxy such as Caddy goes in front)
+--signal-port N           its TCP port, 0 = no signaling (default 55432)
+--max-connections N       signaling connections at once (default 1024)
 --max-entries N           meeting ids kept at once (default 65536)
 --max-sources N           source addresses with their own rate limit (default 65536)
 --max-ids-per-source N    meeting ids one IPv4 address or IPv6 /64 may register (default 128)
@@ -243,6 +248,11 @@ All memory is allocated at startup; nothing is allocated per packet.
 |---|---|
 | default (65536 ids, 65536 sources) | 14 MiB (RSS about 18 MiB) |
 | 1M ids, 1M sources | 225 MiB |
+| signaling, per connection (default 1024) | 12.5 KiB (12.6 MiB) |
+
+Signaling connections have fixed buffers (4.25 KiB in, 8.25 KiB out); one
+whose reader is too slow for what's sent to it is closed, never queued
+without a bound.
 
 Measured on an RK3588 (one Cortex-A76 core, Release build): the logic alone
 handles about 370,000 BIND, 255,000 MEET or 75,000 REGISTER (8 ids) packets
@@ -266,13 +276,16 @@ cmake --build build-asan && ctest --test-dir build-asan
 
 Tests: `wire` (round trips, golden packets, every reject), `server` (the logic
 with a fake clock: cookies, expiry, limits, rate limits, address families,
-STUN), `stun` (RFC 5769's test vectors and every reject), `loopback` (real
-sockets: a fake host registers, a fake client meets, both get each other's
-address; STUN on every socket), `fuzz_replay` and `fuzz_stun_replay` (the
-fuzz targets on every mutation of a valid packet plus millions of random
-ones). With Clang and its sanitizer runtime (Debian / Ubuntu:
-`libclang-rt-<version>-dev`) there are also the libFuzzer targets
-`beacon_fuzz_wire` and `beacon_fuzz_stun`:
+STUN), `stun` (RFC 5769's test vectors and every reject), `ws` (SHA-1 and
+base64 vectors, RFC 6455's accept key, every handshake and frame rule),
+`loopback` (real sockets: a fake host registers, a fake client meets, both
+get each other's address; STUN on every socket), `signal` (real TCP sockets:
+handshake, messages, ping, close, protocol errors, a full pool, timeouts),
+and the `fuzz_*_replay` tests (each fuzz target on every mutation of valid
+input plus millions of random ones). With Clang and its sanitizer runtime
+(Debian / Ubuntu: `libclang-rt-<version>-dev`) there are also the libFuzzer
+targets `beacon_fuzz_wire`, `beacon_fuzz_stun`, `beacon_fuzz_ws_handshake`
+and `beacon_fuzz_ws_frame`:
 
 ```sh
 CC=clang CXX=clang++ cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug
@@ -285,7 +298,8 @@ PORT SECONDS` floods a running server with BINDs (start it with high `--rate`
 and `--burst`).
 
 Dependencies: [Monocypher](https://monocypher.org) (`deps/monocypher`,
-BSD-2-Clause or CC0) for keyed BLAKE2b (cookies and table hashing).
+BSD-2-Clause or CC0) for keyed BLAKE2b (cookies and table hashing). The
+WebSocket handshake's SHA-1 is written here from RFC 3174.
 
 ## License
 

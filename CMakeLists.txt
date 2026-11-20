@@ -80,7 +80,9 @@ add_library(beacon_core STATIC
     server/beacon_server.cpp
     server/beacon_net.cpp
     server/beacon_status.cpp
-    server/beacon_stun.cpp)
+    server/beacon_stun.cpp
+    server/beacon_ws.cpp
+    server/beacon_signal.cpp)
 target_include_directories(beacon_core PUBLIC server)
 target_link_libraries(beacon_core PUBLIC beacon_wire PRIVATE beacon_dep_monocypher)
 beacon_set_flags(beacon_core)
@@ -112,6 +114,16 @@ if(BEACON_TESTS)
     beacon_set_flags(beacon_stun_test)
     add_test(NAME stun COMMAND beacon_stun_test)
 
+    add_executable(beacon_ws_test tests/ws_test.cpp)
+    target_link_libraries(beacon_ws_test PRIVATE beacon_core)
+    beacon_set_flags(beacon_ws_test)
+    add_test(NAME ws COMMAND beacon_ws_test)
+
+    add_executable(beacon_signal_test tests/signal_test.cpp)
+    target_link_libraries(beacon_signal_test PRIVATE beacon_core)
+    beacon_set_flags(beacon_signal_test)
+    add_test(NAME signal COMMAND beacon_signal_test)
+
     add_executable(beacon_loopback_test tests/loopback_test.cpp)
     target_link_libraries(beacon_loopback_test PRIVATE beacon_core)
     beacon_set_flags(beacon_loopback_test)
@@ -129,6 +141,16 @@ if(BEACON_TESTS)
     beacon_set_flags(beacon_fuzz_stun_replay)
     add_test(NAME fuzz_stun_replay COMMAND beacon_fuzz_stun_replay)
 
+    add_executable(beacon_fuzz_ws_handshake_replay tests/fuzz_ws_replay.cpp tests/fuzz_ws_handshake.cpp)
+    target_link_libraries(beacon_fuzz_ws_handshake_replay PRIVATE beacon_core)
+    beacon_set_flags(beacon_fuzz_ws_handshake_replay)
+    add_test(NAME fuzz_ws_handshake_replay COMMAND beacon_fuzz_ws_handshake_replay handshake)
+
+    add_executable(beacon_fuzz_ws_frame_replay tests/fuzz_ws_replay.cpp tests/fuzz_ws_frame.cpp)
+    target_link_libraries(beacon_fuzz_ws_frame_replay PRIVATE beacon_core)
+    beacon_set_flags(beacon_fuzz_ws_frame_replay)
+    add_test(NAME fuzz_ws_frame_replay COMMAND beacon_fuzz_ws_frame_replay frame)
+
     # The real libFuzzer target, with Clang and its runtime (Debian/Ubuntu:
     # libclang-rt-<version>-dev).
     set(BEACON_HAVE_LIBFUZZER OFF)
@@ -144,7 +166,7 @@ if(BEACON_TESTS)
         if(BEACON_LIBFUZZER_LINKS)
             set(BEACON_HAVE_LIBFUZZER ON)
         else()
-            message(STATUS "beacon: Clang without the libFuzzer/sanitizer runtime: no beacon_fuzz_wire / beacon_fuzz_stun")
+            message(STATUS "beacon: Clang without the libFuzzer/sanitizer runtime: no libFuzzer targets")
         endif()
     endif()
     if(BEACON_HAVE_LIBFUZZER)
@@ -161,6 +183,20 @@ if(BEACON_TESTS)
         target_compile_options(beacon_fuzz_stun PRIVATE -fsanitize=fuzzer,address,undefined)
         target_link_options(beacon_fuzz_stun PRIVATE -fsanitize=fuzzer,address,undefined)
         add_test(NAME fuzz_stun COMMAND beacon_fuzz_stun -runs=2000000 -seed=1)
+
+        add_executable(beacon_fuzz_ws_handshake tests/fuzz_ws_handshake.cpp server/beacon_ws.cpp wire/beacon_wire.cpp)
+        target_include_directories(beacon_fuzz_ws_handshake PRIVATE wire server)
+        beacon_set_flags(beacon_fuzz_ws_handshake)
+        target_compile_options(beacon_fuzz_ws_handshake PRIVATE -fsanitize=fuzzer,address,undefined)
+        target_link_options(beacon_fuzz_ws_handshake PRIVATE -fsanitize=fuzzer,address,undefined)
+        add_test(NAME fuzz_ws_handshake COMMAND beacon_fuzz_ws_handshake -runs=1000000 -seed=1)
+
+        add_executable(beacon_fuzz_ws_frame tests/fuzz_ws_frame.cpp server/beacon_ws.cpp wire/beacon_wire.cpp)
+        target_include_directories(beacon_fuzz_ws_frame PRIVATE wire server)
+        beacon_set_flags(beacon_fuzz_ws_frame)
+        target_compile_options(beacon_fuzz_ws_frame PRIVATE -fsanitize=fuzzer,address,undefined)
+        target_link_options(beacon_fuzz_ws_frame PRIVATE -fsanitize=fuzzer,address,undefined)
+        add_test(NAME fuzz_ws_frame COMMAND beacon_fuzz_ws_frame -runs=2000000 -seed=1)
     endif()
 endif()
 

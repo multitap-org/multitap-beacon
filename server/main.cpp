@@ -1,11 +1,13 @@
 // beacon: the server program. Reads the command line, opens the sockets
-// and runs one loop: poll, drain the sockets, housekeeping once a second,
-// counts in the log every --stats-interval seconds. SIGINT / SIGTERM stop it
+// and runs one epoll loop: the UDP sockets, the signaling listener and its
+// connections, housekeeping once a second, counts in the log every
+// --stats-interval seconds. SIGINT / SIGTERM stop it
 // (through a signalfd, so there's no signal-handler global).
 
 #include "beacon_log.h"
 #include "beacon_net.h"
 #include "beacon_server.h"
+#include "beacon_signal.h"
 #include "beacon_status.h"
 
 #include <arpa/inet.h>
@@ -15,15 +17,23 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <unistd.h>
 
 static constexpr uint16_t DEFAULT_PRIMARY_PORT = 55430;
 static constexpr uint16_t DEFAULT_SECONDARY_PORT = 55431;
+static constexpr uint16_t DEFAULT_SIGNAL_PORT = 55432;
 // Packets read from one socket before looking at the others (and the clock) again.
 static constexpr uint32_t PACKETS_PER_ROUND = 256;
 static constexpr uint64_t TICK_MS = 1000;
+static constexpr int MAX_EVENTS = 64;
+
+// epoll tags below the signaling ones (beacon_signal.h).
+static constexpr uint64_t TAG_SIGNALFD = 1;
+static constexpr uint64_t TAG_PRIMARY = 2;
+static constexpr uint64_t TAG_SECONDARY = 3;
+static constexpr uint64_t TAG_STUN = 4;
 
 struct Options
 {
@@ -33,6 +43,9 @@ struct Options
     uint16_t stun_port = 0;                            // 0 = no extra STUN socket
     uint32_t stats_interval_seconds = 60;              // 0 = no stats lines
     const char* status_file = nullptr;                 // --status-file, nullptr = none
+    const char* signal_bind = "127.0.0.1";             // the WebSocket listener, behind a TLS proxy
+    uint16_t signal_port = DEFAULT_SIGNAL_PORT;        // 0 = no signaling
+    BeaconSignalConfig signal_config = {};
     BeaconServerConfig config = {};
     BeaconLogLevel log_level = BeaconLogLevel::info;
 };
@@ -40,6 +53,7 @@ struct Options
 static void print_usage(FILE* out)
 {
     BeaconServerConfig defaults = {};
+    BeaconSignalConfig signal_defaults = {};
     fprintf(out,
             "beacon " BEACON_VERSION_STRING
             ": introduces paired piccolo devices so they can connect directly (UDP hole punching).\n"
@@ -58,6 +72,10 @@ static void print_usage(FILE* out)
             "  --rate N                  packets per second per source (default %" PRIu32 ")\n"
             "  --burst N                 packets a source may send at once (default %" PRIu32 ")\n"
             "  --overflow-rate N         packets per second shared by sources that don't fit (default %" PRIu32 ")\n"
+"  --signal-bind ADDRESS     numeric address for the WebSocket signaling listener (default 127.0.0.1:\n"
+            "                            a TLS proxy such as Caddy goes in front)\n"
+            "  --signal-port N           its TCP port, 0 = no signaling (default %u)\n"
+            "  --max-connections N       signaling connections at once (default %" PRIu32 ")\n"
             "  --public-address IP       the server's public IPv4 or IPv6 address, for a server behind a NAT\n"
             "                            with port forwarding: senders from private addresses are reported\n"
             "                            with it (give it twice for both families; default: off)\n"
@@ -69,7 +87,8 @@ static void print_usage(FILE* out)
             "  --help                    this text\n",
             static_cast<unsigned>(DEFAULT_PRIMARY_PORT), static_cast<unsigned>(DEFAULT_SECONDARY_PORT),
             defaults.max_entries, defaults.max_sources, defaults.max_ids_per_source, defaults.rate_per_second,
-            defaults.burst, defaults.overflow_rate_per_second);
+            defaults.burst, defaults.overflow_rate_per_second, static_cast<unsigned>(DEFAULT_SIGNAL_PORT),
+            signal_defaults.max_connections);
 }
 
 // A decimal number in [min, max], nothing else.
@@ -185,6 +204,25 @@ static int parse_options(int argc, char** argv, Options* options)
                 return 1;
             }
         }
+        else if (strcmp(name, "--signal-bind") == 0)
+        {
+            options->signal_bind = value;
+        }
+        else if (strcmp(name, "--signal-port") == 0)
+        {
+            if (!parse_number(name, value, 0, 65535, &number))
+            {
+                return 1;
+            }
+            options->signal_port = static_cast<uint16_t>(number);
+        }
+        else if (strcmp(name, "--max-connections") == 0)
+        {
+            if (!parse_number(name, value, 1, BEACON_SIGNAL_MAX_CONNECTIONS, &options->signal_config.max_connections))
+            {
+                return 1;
+            }
+        }
         else if (strcmp(name, "--stun-port") == 0)
         {
             if (!parse_number(name, value, 0, 65535, &number))
@@ -279,6 +317,20 @@ static int parse_options(int argc, char** argv, Options* options)
     return 0;
 }
 
+static void log_signal_stats(BeaconSignal* signal, uint32_t seconds)
+{
+    const BeaconSignalStats* s = &signal->stats;
+    beacon_log(BeaconLogLevel::info,
+               "signaling, last %" PRIu32 " s: %" PRIu64 " accepted (%" PRIu64 " refused, pool full), %" PRIu64
+               " handshakes (%" PRIu64 " bad), %" PRIu64 " messages, %" PRIu64 " protocol errors, %" PRIu64
+               " timeouts, %" PRIu64 " slow readers; now %" PRIu32 " open",
+               seconds, s->accepted, s->refused_full, s->handshakes, s->bad_handshakes, s->messages,
+               s->protocol_errors, s->timeouts, s->slow_readers, s->open);
+    uint32_t open = s->open;
+    signal->stats = BeaconSignalStats{};
+    signal->stats.open = open;
+}
+
 static void log_stats(const BeaconServer* server, const BeaconNet* net, uint32_t seconds)
 {
     const BeaconStats* s = &server->stats;
@@ -320,77 +372,116 @@ static void write_status(BeaconStatus* status, BeaconServer* server, uint64_t no
                          beacon_unix_seconds());
 }
 
-// `status` is nullptr without --status-file.
-static void run(BeaconServer* server, BeaconNet* net, int signal_fd, uint32_t stats_interval_seconds,
-                BeaconStatus* status)
+// Everything the loop drives. `signal` and `status` are nullptr when off.
+struct Loop
+{
+    BeaconServer* server = nullptr;
+    BeaconNet* net = nullptr;
+    BeaconSignal* signal = nullptr;
+    BeaconStatus* status = nullptr;
+    int signal_fd = -1;
+    int epoll_fd = -1;
+    uint32_t stats_interval_seconds = 0;
+};
+
+static bool epoll_add(int epoll_fd, int fd, uint64_t tag)
+{
+    if (fd < 0)
+    {
+        return true;
+    }
+    epoll_event event = {};
+    event.events = EPOLLIN;
+    event.data.u64 = tag;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0)
+    {
+        beacon_log(BeaconLogLevel::error, "epoll_ctl: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static void run(Loop* loop)
 {
     uint64_t now = beacon_now_ms();
     uint64_t next_tick = now + TICK_MS;
     uint64_t next_status = now + BEACON_STATUS_INTERVAL_MS;
-    if (status != nullptr)
+    if (loop->status != nullptr)
     {
-        write_status(status, server, now);
+        write_status(loop->status, loop->server, now);
     }
-    uint64_t stats_ms = static_cast<uint64_t>(stats_interval_seconds) * 1000u;
+    uint64_t stats_ms = static_cast<uint64_t>(loop->stats_interval_seconds) * 1000u;
     uint64_t next_stats = now + stats_ms;
     bool running = true;
+    epoll_event events[MAX_EVENTS];
     while (running)
     {
-        pollfd fds[4] = {};
-        nfds_t count = 0;
-        fds[count++] = pollfd{.fd = signal_fd, .events = POLLIN};
-        fds[count++] = pollfd{.fd = net->primary_fd, .events = POLLIN};
-        // -1 fds are ignored by poll, so the indexes stay fixed.
-        fds[count++] = pollfd{.fd = net->secondary_fd, .events = POLLIN};
-        fds[count++] = pollfd{.fd = net->stun_fd, .events = POLLIN};
         now = beacon_now_ms();
         int timeout = next_tick > now ? static_cast<int>(next_tick - now) : 0;
-        int ready = poll(fds, count, timeout);
+        int ready = epoll_wait(loop->epoll_fd, events, MAX_EVENTS, timeout);
         if (ready < 0 && errno != EINTR)
         {
-            beacon_log(BeaconLogLevel::error, "poll: %s", strerror(errno));
+            beacon_log(BeaconLogLevel::error, "epoll_wait: %s", strerror(errno));
             break;
         }
         now = beacon_now_ms();
-        if (ready > 0)
+        for (int i = 0; i < ready; i++)
         {
-            if ((fds[0].revents & POLLIN) != 0)
+            uint64_t tag = events[i].data.u64;
+            if (tag == TAG_SIGNALFD)
             {
                 signalfd_siginfo info = {};
-                ssize_t got = read(signal_fd, &info, sizeof(info));
+                ssize_t got = read(loop->signal_fd, &info, sizeof(info));
                 if (got == static_cast<ssize_t>(sizeof(info)))
                 {
                     beacon_log(BeaconLogLevel::info, "signal %" PRIu32 ": stopping", info.ssi_signo);
                 }
                 running = false;
             }
-            if ((fds[1].revents & POLLIN) != 0)
+            else if (tag == TAG_PRIMARY)
             {
-                beacon_net_drain(net, server, now, BeaconSocket::PRIMARY, PACKETS_PER_ROUND);
+                beacon_net_drain(loop->net, loop->server, now, BeaconSocket::PRIMARY, PACKETS_PER_ROUND);
             }
-            if ((fds[2].revents & POLLIN) != 0)
+            else if (tag == TAG_SECONDARY)
             {
-                beacon_net_drain(net, server, now, BeaconSocket::SECONDARY, PACKETS_PER_ROUND);
+                beacon_net_drain(loop->net, loop->server, now, BeaconSocket::SECONDARY, PACKETS_PER_ROUND);
             }
-            if ((fds[3].revents & POLLIN) != 0)
+            else if (tag == TAG_STUN)
             {
-                beacon_net_drain(net, server, now, BeaconSocket::STUN, PACKETS_PER_ROUND);
+                beacon_net_drain(loop->net, loop->server, now, BeaconSocket::STUN, PACKETS_PER_ROUND);
+            }
+            else if (tag == BEACON_SIGNAL_TAG_LISTEN && loop->signal != nullptr)
+            {
+                beacon_signal_accept(loop->signal, now);
+            }
+            else if (tag >= BEACON_SIGNAL_TAG_FIRST_CONNECTION && loop->signal != nullptr)
+            {
+                uint64_t index = tag - BEACON_SIGNAL_TAG_FIRST_CONNECTION;
+                beacon_signal_event(loop->signal, static_cast<uint32_t>(index), events[i].events, now);
             }
         }
         if (now >= next_tick)
         {
-            beacon_server_tick(server, now);
+            beacon_server_tick(loop->server, now);
+            if (loop->signal != nullptr)
+            {
+                beacon_signal_tick(loop->signal, now);
+            }
             next_tick = now + TICK_MS;
         }
-        if (status != nullptr && now >= next_status)
+        if (loop->status != nullptr && now >= next_status)
         {
-            write_status(status, server, now);
+            write_status(loop->status, loop->server, now);
             next_status = now + BEACON_STATUS_INTERVAL_MS;
         }
         if (stats_ms != 0 && now >= next_stats)
         {
-            log_stats(server, net, stats_interval_seconds);
-            beacon_server_stats_reset(server);
+            log_stats(loop->server, loop->net, loop->stats_interval_seconds);
+            beacon_server_stats_reset(loop->server);
+            if (loop->signal != nullptr)
+            {
+                log_signal_stats(loop->signal, loop->stats_interval_seconds);
+            }
             next_stats = now + stats_ms;
         }
     }
@@ -446,23 +537,65 @@ int main(int argc, char** argv)
         beacon_log(BeaconLogLevel::info, "STUN-only port: UDP %u", static_cast<unsigned>(net.stun_port));
     }
 
+    Loop loop;
+    loop.server = &server;
+    loop.net = &net;
+    loop.signal_fd = signal_fd;
+    loop.stats_interval_seconds = options.stats_interval_seconds;
+    loop.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    bool ready = loop.epoll_fd >= 0 && epoll_add(loop.epoll_fd, signal_fd, TAG_SIGNALFD) &&
+                 epoll_add(loop.epoll_fd, net.primary_fd, TAG_PRIMARY) &&
+                 epoll_add(loop.epoll_fd, net.secondary_fd, TAG_SECONDARY) &&
+                 epoll_add(loop.epoll_fd, net.stun_fd, TAG_STUN);
+
+    BeaconSignal signal;
+    if (ready && options.signal_port != 0)
+    {
+        if (beacon_signal_open(&signal, &options.signal_config, options.signal_bind, options.signal_port,
+                               loop.epoll_fd))
+        {
+            loop.signal = &signal;
+            beacon_log(BeaconLogLevel::info,
+                       "signaling: WebSocket on [%s] TCP %u, %" PRIu32 " connections (%" PRIu64 " KiB)",
+                       options.signal_bind, static_cast<unsigned>(signal.port),
+                       options.signal_config.max_connections, beacon_signal_pool_bytes(&signal) / 1024);
+        }
+        else
+        {
+            ready = false;
+        }
+    }
+
     BeaconStatus status;
-    BeaconStatus* status_used = nullptr;
     if (options.status_file != nullptr && beacon_status_open(&status, options.status_file))
     {
         beacon_log(BeaconLogLevel::info, "status file: %s, every %" PRIu64 " s", options.status_file,
                    BEACON_STATUS_INTERVAL_MS / 1000);
-        status_used = &status;
+        loop.status = &status;
     }
 
-    run(&server, &net, signal_fd, options.stats_interval_seconds, status_used);
-
-    if (options.stats_interval_seconds != 0)
+    if (ready)
     {
-        log_stats(&server, &net, options.stats_interval_seconds);
+        run(&loop);
+        if (options.stats_interval_seconds != 0)
+        {
+            log_stats(&server, &net, options.stats_interval_seconds);
+            if (loop.signal != nullptr)
+            {
+                log_signal_stats(loop.signal, options.stats_interval_seconds);
+            }
+        }
+    }
+    if (loop.signal != nullptr)
+    {
+        beacon_signal_close(loop.signal);
+    }
+    if (loop.epoll_fd >= 0)
+    {
+        close(loop.epoll_fd);
     }
     beacon_net_close(&net);
     beacon_server_destroy(&server);
     close(signal_fd);
-    return 0;
+    return ready ? 0 : 1;
 }
