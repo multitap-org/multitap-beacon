@@ -350,6 +350,111 @@ static void test_field_rejects()
     check(beacon_encode(&odd, packet, sizeof(packet)) == 0, "encode refuses an unknown type");
 }
 
+// Signaling messages: round trips, golden bytes, every reject.
+static void test_signaling()
+{
+    BeaconSignalingMessage m;
+    BeaconSignalingMessage d;
+    uint8_t out[BEACON_SIGNALING_MAX_SIZE + 8];
+    for (uint32_t i = 0; i < BEACON_ID_SIZE; i++)
+    {
+        m.room.bytes[i] = static_cast<uint8_t>(0xa0 + i);
+    }
+
+    m.type = BeaconSignalingType::JOIN;
+    m.role = BeaconRole::CLIENT;
+    uint32_t size = beacon_signaling_encode(&m, out, sizeof(out));
+    const uint8_t golden_join[28] = {'M', 'T', 'B', 'C', 1, 16, 0, 0, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
+                                     0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 2, 0, 0, 0};
+    check(size == 28 && memcmp(out, golden_join, 28) == 0, "JOIN golden bytes");
+    check(beacon_signaling_decode(out, size, &d) && d.type == BeaconSignalingType::JOIN && d.role == BeaconRole::CLIENT &&
+              beacon_id_equal(&d.room, &m.room),
+          "JOIN round trip");
+
+    const BeaconSignalingType room_only[] = {BeaconSignalingType::LEAVE, BeaconSignalingType::PEER_JOINED,
+                                             BeaconSignalingType::LEFT, BeaconSignalingType::NOT_FOUND};
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        m.type = room_only[i];
+        size = beacon_signaling_encode(&m, out, sizeof(out));
+        check(size == BEACON_SIGNALING_SIZE_ROOM && beacon_signaling_decode(out, size, &d) && d.type == room_only[i],
+              "room-only message round trip");
+        check(!beacon_signaling_decode(out, size + 1, &d), "a room-only message one byte long is refused");
+    }
+
+    m.type = BeaconSignalingType::JOINED;
+    m.peer_present = 1;
+    size = beacon_signaling_encode(&m, out, sizeof(out));
+    check(size == 28 && out[24] == 1 && beacon_signaling_decode(out, size, &d) && d.peer_present == 1, "JOINED");
+    out[24] = 2;
+    check(!beacon_signaling_decode(out, size, &d), "JOINED with peer_present 2 is refused");
+    m.peer_present = 2;
+    check(beacon_signaling_encode(&m, out, sizeof(out)) == 0, "JOINED with peer_present 2 doesn't encode");
+    m.peer_present = 0;
+
+    m.type = BeaconSignalingType::REFUSED;
+    m.reason = BeaconRefusal::ROOMS_FULL;
+    size = beacon_signaling_encode(&m, out, sizeof(out));
+    check(size == 28 && beacon_signaling_decode(out, size, &d) && d.reason == BeaconRefusal::ROOMS_FULL, "REFUSED");
+    out[24] = 3;
+    check(!beacon_signaling_decode(out, size, &d), "an unknown refusal reason is refused");
+
+    // SIGNAL: 1-4096 opaque bytes, the length from the message.
+    uint8_t blob[BEACON_SIGNALING_MAX_BLOB + 1];
+    for (uint32_t i = 0; i < sizeof(blob); i++)
+    {
+        blob[i] = static_cast<uint8_t>(i * 13);
+    }
+    m.type = BeaconSignalingType::SIGNAL;
+    m.blob = blob;
+    const uint32_t blob_sizes[] = {1, 100, BEACON_SIGNALING_MAX_BLOB};
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        m.blob_size = blob_sizes[i];
+        size = beacon_signaling_encode(&m, out, sizeof(out));
+        check(size == 24 + blob_sizes[i] && beacon_signaling_decode(out, size, &d) &&
+                  d.blob_size == blob_sizes[i] && d.blob == out + 24 && memcmp(d.blob, blob, d.blob_size) == 0,
+              "SIGNAL round trip");
+    }
+    m.blob_size = BEACON_SIGNALING_MAX_BLOB + 1;
+    check(beacon_signaling_encode(&m, out, sizeof(out)) == 0, "a 4097-byte blob doesn't encode");
+    m.blob_size = 0;
+    check(beacon_signaling_encode(&m, out, sizeof(out)) == 0, "an empty blob doesn't encode");
+    m.blob_size = 10;
+    check(beacon_signaling_encode(&m, out, 33) == 0, "SIGNAL that doesn't fit");
+    size = beacon_signaling_encode(&m, out, sizeof(out));
+    check(!beacon_signaling_decode(out, 24, &d), "SIGNAL without a blob is refused");
+    memset(out + size, 0, BEACON_SIGNALING_MAX_SIZE + 1 - size);
+    check(!beacon_signaling_decode(out, BEACON_SIGNALING_MAX_SIZE + 1, &d), "SIGNAL over the limit is refused");
+
+    // Header and field rules.
+    m.type = BeaconSignalingType::JOIN;
+    m.role = BeaconRole::HOST;
+    size = beacon_signaling_encode(&m, out, sizeof(out));
+    uint8_t bad[28];
+    const uint32_t positions[] = {0, 3, 4, 6, 7, 25, 27};
+    for (uint32_t i = 0; i < 7; i++)
+    {
+        memcpy(bad, out, 28);
+        bad[positions[i]] = static_cast<uint8_t>(bad[positions[i]] ^ 0x40);
+        check(!beacon_signaling_decode(bad, 28, &d), "a JOIN with a bad header or padding byte is refused");
+    }
+    memcpy(bad, out, 28);
+    bad[24] = 3;
+    check(!beacon_signaling_decode(bad, 28, &d), "a JOIN with role 3 is refused");
+    memcpy(bad, out, 28);
+    memset(bad + 8, 0, 16);
+    check(!beacon_signaling_decode(bad, 28, &d), "a zero room is refused");
+    memcpy(bad, out, 28);
+    bad[5] = 9;   // PUNCH: a UDP type
+    check(!beacon_signaling_decode(bad, 28, &d), "a UDP type doesn't decode as signaling");
+    BeaconMessage udp;
+    bad[5] = 16;
+    check(!beacon_decode(bad, 28, &udp), "a signaling type doesn't decode as UDP");
+    m.room = BeaconId{};
+    check(beacon_signaling_encode(&m, out, sizeof(out)) == 0, "a zero room doesn't encode");
+}
+
 int main()
 {
     test_round_trips();
@@ -357,6 +462,7 @@ int main()
     test_header_rejects();
     test_padding_rejects();
     test_field_rejects();
+    test_signaling();
     if (g_failures != 0)
     {
         fprintf(stderr, "%u failures\n", g_failures);

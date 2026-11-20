@@ -27,7 +27,7 @@
 
 constexpr size_t BEACON_WS_MAX_HANDSHAKE = 4096;
 // The largest message: SIGNAL = header (8) + room (16) + blob (4096).
-constexpr size_t BEACON_WS_MAX_PAYLOAD = 8 + 16 + 4096;
+constexpr size_t BEACON_WS_MAX_PAYLOAD = BEACON_SIGNALING_MAX_SIZE;
 // Frame header from a client: 2 + 2 (16-bit length) + 4 (mask).
 constexpr size_t BEACON_WS_MAX_CLIENT_HEADER = 8;
 // Frame header from beacon: 2 + 2 (16-bit length), no mask.
@@ -51,7 +51,7 @@ constexpr uint16_t BEACON_WS_CLOSE_NORMAL = 1000;
 constexpr uint16_t BEACON_WS_CLOSE_GOING_AWAY = 1001;
 constexpr uint16_t BEACON_WS_CLOSE_PROTOCOL_ERROR = 1002;
 constexpr uint16_t BEACON_WS_CLOSE_UNSUPPORTED = 1003;     // a text frame
-constexpr uint16_t BEACON_WS_CLOSE_POLICY = 1008;          // a limit (3b)
+constexpr uint16_t BEACON_WS_CLOSE_POLICY = 1008;          // a rate limit, both sides of one room
 constexpr uint16_t BEACON_WS_CLOSE_TOO_BIG = 1009;
 
 enum class BeaconWsParse : uint8_t
@@ -103,6 +103,9 @@ size_t beacon_ws_handshake_response(const BeaconWsHandshake* handshake, char* ou
 
 // The 400 response for a refused handshake (then the connection closes).
 size_t beacon_ws_bad_request_response(char* out, size_t capacity);
+
+// The 429 response for a source with too many connections.
+size_t beacon_ws_too_many_response(char* out, size_t capacity);
 
 // One client frame at the start of `data`. On OK the payload is unmasked in
 // place (so `data` is changed) and `out` describes it.

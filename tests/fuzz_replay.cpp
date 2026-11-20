@@ -75,6 +75,49 @@ int main()
         }
     }
 
+    // Signaling messages: every byte change of each type and of a SIGNAL, and
+    // every truncation.
+    static uint8_t signaling[BEACON_SIGNALING_MAX_SIZE + 64];
+    static uint8_t signaling_mutated[BEACON_SIGNALING_MAX_SIZE + 64];
+    static uint8_t blob[300];
+    for (uint32_t i = 0; i < sizeof(blob); i++)
+    {
+        blob[i] = static_cast<uint8_t>(i);
+    }
+    for (uint32_t type = 16; type <= 23; type++)
+    {
+        BeaconSignalingMessage m;
+        m.type = static_cast<BeaconSignalingType>(type);
+        memset(m.room.bytes, 0x5a, BEACON_ID_SIZE);
+        m.role = BeaconRole::CLIENT;
+        m.peer_present = 1;
+        m.reason = BeaconRefusal::ROOMS_FULL;
+        m.blob = blob;
+        m.blob_size = sizeof(blob);
+        uint32_t size = beacon_signaling_encode(&m, signaling, sizeof(signaling));
+        if (size == 0)
+        {
+            fprintf(stderr, "FAIL: signaling sample of type %u doesn't encode\n", type);
+            return 1;
+        }
+        memset(signaling + size, 0, 64);
+        for (uint32_t at = 0; at < size && at < 64; at++)
+        {
+            for (uint32_t v = 0; v < sizeof(BYTE_VALUES); v++)
+            {
+                memcpy(signaling_mutated, signaling, size);
+                signaling_mutated[at] = BYTE_VALUES[v];
+                LLVMFuzzerTestOneInput(signaling_mutated, size);
+                runs++;
+            }
+        }
+        for (uint32_t cut = 0; cut <= size + 64; cut++)
+        {
+            LLVMFuzzerTestOneInput(signaling, cut);
+            runs++;
+        }
+    }
+
     uint64_t state = 0x9e3779b97f4a7c15ull;
     for (uint32_t i = 0; i < 2000000; i++)
     {

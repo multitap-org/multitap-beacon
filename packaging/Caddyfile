@@ -1,0 +1,29 @@
+# Caddy in front of beacon: TLS for the WebSocket signaling (browsers need
+# wss://) and, optionally, the status page. Replace the host name, put this in
+# /etc/caddy/Caddyfile (or import it) and reload Caddy.
+#
+# beacon itself listens on 127.0.0.1:55432 (--signal-port, --signal-bind).
+# Caddy sets X-Forwarded-For to the client's address, and beacon believes it
+# from loopback, so its per-source limits see the real clients.
+#
+# UDP 55430 / 55431 (and 3478 with --stun-port) don't go through Caddy:
+# open them in the firewall as usual.
+
+beacon.example.org {
+    # WebRTC signaling: wss://beacon.example.org/signal
+    handle /signal {
+        reverse_proxy 127.0.0.1:55432
+    }
+
+    # The status page (README.md, "Status page"): beacon --status-file
+    # /run/beacon/status.json, the page copied to /srv/beacon-status.
+    handle /status.json {
+        root * /run/beacon
+        header Cache-Control no-store
+        file_server
+    }
+    handle {
+        root * /srv/beacon-status
+        file_server
+    }
+}

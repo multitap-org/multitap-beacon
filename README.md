@@ -22,8 +22,15 @@ configuration file, no database, no disk.
    connection is encrypted and authenticated end to end (Noise XX, the same as
    on a LAN); the server never sees any of it.
 
-It is also a plain **STUN server** for browsers (WebRTC): standard Binding
-Requests on the same ports get the sender's public address back.
+For browsers (WebRTC), which can't send raw UDP, it also is:
+
+4. **A STUN server**: standard Binding Requests on the same UDP ports get the
+   sender's public address back.
+5. **A signaling relay**: a WebSocket listener (behind a TLS proxy) where two
+   peers that know the same meeting id meet in a "room" and pass each other
+   their WebRTC offer, answer and ICE candidates. Those messages are encrypted
+   end to end by the peers: beacon passes them along without being able to
+   read them. The connection itself is then direct, as with UDP.
 
 The wire format is in [`PROTOCOL.md`](PROTOCOL.md): every message is a fixed
 size binary struct, nothing is ever read as a length or a string, and a reply
@@ -194,6 +201,36 @@ volumes:
 In Nginx Proxy Manager, add a proxy host for the status name with forward
 host `beacon-page`, port 80 (the containers must share a network with NPM).
 
+### Signaling for browsers (WebRTC)
+
+beacon listens for WebSocket on `127.0.0.1:55432` and never does TLS itself;
+browsers on an https page only open `wss://`, so a TLS proxy in front is
+required. Clients use `wss://your.host.name/signal`.
+
+**Caddy** (gets the certificate on its own): [`packaging/Caddyfile`](packaging/Caddyfile)
+proxies `/signal` to beacon and serves the status page. Caddy replaces
+whatever `X-Forwarded-For` a client sends with the client's real address, and
+beacon believes that header from loopback, so its per-source limits see the
+real clients.
+
+**Nginx Proxy Manager in Docker.** beacon runs with host networking, so a
+proxy container on a bridge network can't reach its 127.0.0.1. Bind the
+signaling listener to the Docker bridge instead, and trust the Docker
+networks' X-Forwarded-For:
+
+```yaml
+    command: ["--signal-bind", "172.17.0.1", "--trusted-proxy", "172.16.0.0/12"]
+```
+
+(172.17.0.1 is the default `docker0` address; with a compose network, use
+its gateway.) Then add a proxy host in NPM: scheme `http`, forward host
+`172.17.0.1`, port `55432`, **Websockets Support** on, an SSL certificate,
+and a custom location `/signal` if the name also serves the status page. Keep
+TCP 55432 closed to the outside (it's only on the bridge address).
+
+Without a proxy (testing only): `--signal-bind 0.0.0.0` exposes plain `ws://`,
+which only pages served over http can use.
+
 ## Ports and firewall
 
 | port | protocol | what |
@@ -221,6 +258,11 @@ symmetric NAT early.
                           a TLS proxy such as Caddy goes in front)
 --signal-port N           its TCP port, 0 = no signaling (default 55432)
 --max-connections N       signaling connections at once (default 1024)
+--max-rooms N             signaling rooms at once (default 65536)
+--max-connections-per-source N
+                          signaling connections from one IPv4 address or IPv6 /64 (default 8)
+--trusted-proxy IP[/N]    a proxy whose X-Forwarded-For is believed, e.g. a Docker network
+                          (172.16.0.0/12); loopback always is; up to 8 times
 --max-entries N           meeting ids kept at once (default 65536)
 --max-sources N           source addresses with their own rate limit (default 65536)
 --max-ids-per-source N    meeting ids one IPv4 address or IPv6 /64 may register (default 128)
@@ -248,11 +290,12 @@ All memory is allocated at startup; nothing is allocated per packet.
 |---|---|
 | default (65536 ids, 65536 sources) | 14 MiB (RSS about 18 MiB) |
 | 1M ids, 1M sources | 225 MiB |
-| signaling, per connection (default 1024) | 12.5 KiB (12.6 MiB) |
+| signaling (1024 connections, 65536 rooms) | 16.4 MiB (12.6 KiB per connection) |
 
 Signaling connections have fixed buffers (4.25 KiB in, 8.25 KiB out); one
 whose reader is too slow for what's sent to it is closed, never queued
-without a bound.
+without a bound. Per connection: 64 rooms, 20 messages per second (burst 60)
+and 16 KiB per second (burst 64 KiB).
 
 Measured on an RK3588 (one Cortex-A76 core, Release build): the logic alone
 handles about 370,000 BIND, 255,000 MEET or 75,000 REGISTER (8 ids) packets
@@ -280,7 +323,9 @@ STUN), `stun` (RFC 5769's test vectors and every reject), `ws` (SHA-1 and
 base64 vectors, RFC 6455's accept key, every handshake and frame rule),
 `loopback` (real sockets: a fake host registers, a fake client meets, both
 get each other's address; STUN on every socket), `signal` (real TCP sockets:
-handshake, messages, ping, close, protocol errors, a full pool, timeouts),
+handshake, ping, close, protocol errors, rooms, replacement, room and rate
+limits, the per-source limit with X-Forwarded-For, a full pool, timeouts, a
+slow reader),
 and the `fuzz_*_replay` tests (each fuzz target on every mutation of valid
 input plus millions of random ones). With Clang and its sanitizer runtime
 (Debian / Ubuntu: `libclang-rt-<version>-dev`) there are also the libFuzzer

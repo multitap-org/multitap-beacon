@@ -90,6 +90,67 @@ bool beacon_decode(const uint8_t* data, size_t size, BeaconMessage* out);
 // breaks a field rule or `capacity` is too small (nothing useful is written then).
 uint32_t beacon_encode(const BeaconMessage* message, uint8_t* out, size_t capacity);
 
+// ---------------------------------------------------------------------------
+// Signaling (WebRTC), over the WebSocket listener (PROTOCOL.md, "Signaling").
+// Each message is one binary WebSocket message with the same 8-byte header
+// ("MTBC", version, type, two zero bytes) and its own type numbers (16 and
+// up, so a UDP packet with one of them, or the reverse, never decodes). Every
+// type has one fixed size except SIGNAL, whose blob is 1-4096 opaque bytes:
+// its length is the WebSocket message's length minus 24, never a field.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t BEACON_SIGNALING_MAX_BLOB = 4096;
+constexpr uint32_t BEACON_SIGNALING_SIZE_JOIN = 28;
+constexpr uint32_t BEACON_SIGNALING_SIZE_JOINED = 28;
+constexpr uint32_t BEACON_SIGNALING_SIZE_REFUSED = 28;
+// LEAVE, PEER_JOINED, LEFT, NOT_FOUND: the header and the room.
+constexpr uint32_t BEACON_SIGNALING_SIZE_ROOM = 24;
+constexpr uint32_t BEACON_SIGNALING_SIGNAL_HEADER = 24;
+constexpr uint32_t BEACON_SIGNALING_MAX_SIZE = BEACON_SIGNALING_SIGNAL_HEADER + BEACON_SIGNALING_MAX_BLOB;
+
+enum class BeaconSignalingType : uint8_t
+{
+    JOIN = 16,          // c->s: room, role
+    JOINED = 17,        // s->c: room, whether the other side is there
+    LEAVE = 18,         // c->s: room
+    PEER_JOINED = 19,   // s->c: room (the other side arrived)
+    LEFT = 20,          // s->c: room (the other side left, or this socket was replaced)
+    SIGNAL = 21,        // both: room, blob (passed to the other side as is)
+    NOT_FOUND = 22,     // s->c: room (a SIGNAL with no one on the other side)
+    REFUSED = 23,       // s->c: room, reason (a JOIN over a limit)
+};
+
+enum class BeaconRole : uint8_t
+{
+    HOST = 1,
+    CLIENT = 2,
+};
+
+enum class BeaconRefusal : uint8_t
+{
+    ROOMS_PER_CONNECTION = 1,   // this socket is in too many rooms
+    ROOMS_FULL = 2,             // the server's room table is full
+};
+
+struct BeaconSignalingMessage
+{
+    BeaconSignalingType type = BeaconSignalingType::JOIN;
+    BeaconId room = {};                 // every type; never zero
+    BeaconRole role = BeaconRole::HOST; // JOIN
+    uint8_t peer_present = 0;           // JOINED: 0 or 1
+    BeaconRefusal reason = BeaconRefusal::ROOMS_PER_CONNECTION;  // REFUSED
+    const uint8_t* blob = nullptr;      // SIGNAL: points into the decoded data
+    uint32_t blob_size = 0;             // SIGNAL: 1-4096
+};
+
+// True if `data` is exactly one valid signaling message (fields as above,
+// padding zero). For SIGNAL, `out->blob` points into `data`.
+bool beacon_signaling_decode(const uint8_t* data, size_t size, BeaconSignalingMessage* out);
+
+// Writes `message` into `out` (a SIGNAL's blob must not overlap `out`).
+// Returns the bytes written, or 0 if it breaks a field rule or doesn't fit.
+uint32_t beacon_signaling_encode(const BeaconSignalingMessage* message, uint8_t* out, size_t capacity);
+
 // Small helpers for both sides.
 bool beacon_id_is_zero(const BeaconId* id);
 bool beacon_id_equal(const BeaconId* a, const BeaconId* b);

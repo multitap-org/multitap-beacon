@@ -517,6 +517,17 @@ size_t beacon_ws_bad_request_response(char* out, size_t capacity)
     return sizeof(RESPONSE) - 1;
 }
 
+size_t beacon_ws_too_many_response(char* out, size_t capacity)
+{
+    static const char RESPONSE[] = "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    if (capacity < sizeof(RESPONSE))
+    {
+        return 0;
+    }
+    memcpy(out, RESPONSE, sizeof(RESPONSE));
+    return sizeof(RESPONSE) - 1;
+}
+
 // ---------------------------------------------------------------------------
 // Frames
 // ---------------------------------------------------------------------------

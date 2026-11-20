@@ -1,7 +1,9 @@
-// beacon_signal over real TCP sockets on loopback, step 3a: the handshake,
-// echo of binary messages (one frame, split frames, the largest frame),
-// ping / pong, the close handshake, protocol errors, a full pool, timeouts.
-// Single-threaded: the test's blocking clients alternate with an epoll pump.
+// beacon_signal over real TCP sockets on loopback: the handshake, ping /
+// pong, the close handshake, protocol errors, rooms (JOIN, PEER_JOINED,
+// SIGNAL passed as is, replacement, LEAVE, LEFT on close, NOT_FOUND), room
+// limits, rate limits, the per-source limit with X-Forwarded-For, a full
+// pool, timeouts, a slow reader. Single-threaded: the test's blocking
+// clients alternate with an epoll pump.
 
 #include "beacon_net.h"
 #include "beacon_signal.h"
@@ -34,6 +36,19 @@ struct Harness
     uint64_t now = 1000000;
 };
 
+static bool harness_open(Harness* h, const BeaconSignalConfig* config)
+{
+    h->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    h->now = 1000000;
+    return beacon_signal_open(&h->signal, config, "127.0.0.1", 0, h->epoll_fd);
+}
+
+static void harness_close(Harness* h)
+{
+    beacon_signal_close(&h->signal);
+    close(h->epoll_fd);
+}
+
 // Hands every ready event to the signal module (waits up to `timeout_ms`).
 static void pump(Harness* h, int timeout_ms)
 {
@@ -54,9 +69,21 @@ static void pump(Harness* h, int timeout_ms)
     }
 }
 
-static int client_connect(Harness* h)
+static void pump_a_while(Harness* h)
+{
+    for (int i = 0; i < 20; i++)
+    {
+        pump(h, 5);
+    }
+}
+
+static int client_connect(Harness* h, int receive_buffer)
 {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (receive_buffer > 0)
+    {
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
+    }
     sockaddr_in to = {};
     to.sin_family = AF_INET;
     to.sin_port = htons(h->signal.port);
@@ -74,15 +101,15 @@ static void client_send(Harness* h, int fd, const std::string& bytes)
 {
     ssize_t sent = send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
     check(sent == static_cast<ssize_t>(bytes.size()), "client sends");
-    pump(h, 100);
+    pump(h, 50);
 }
 
 // Reads exactly `size` bytes (pumping the server while waiting), or until
-// EOF / 2 s. Returns what arrived.
-static std::string client_read(Harness* h, int fd, size_t size)
+// EOF / `rounds` x 10 ms. Returns what arrived.
+static std::string client_read_for(Harness* h, int fd, size_t size, int rounds)
 {
     std::string got;
-    for (int round = 0; round < 200 && got.size() < size; round++)
+    for (int round = 0; round < rounds && got.size() < size; round++)
     {
         pollfd p = {.fd = fd, .events = POLLIN};
         if (poll(&p, 1, 0) <= 0)
@@ -102,18 +129,30 @@ static std::string client_read(Harness* h, int fd, size_t size)
     return got;
 }
 
-// Whether the server closed the connection (EOF within 2 s).
+static std::string client_read(Harness* h, int fd, size_t size)
+{
+    return client_read_for(h, fd, size, 200);
+}
+
+// Whether nothing arrives for a little while.
+static bool client_quiet(Harness* h, int fd)
+{
+    return client_read_for(h, fd, 1, 10).empty();
+}
+
+// Whether the server closed the connection (EOF within 2 s), reading past
+// anything that comes before it.
 static bool client_sees_eof(Harness* h, int fd)
 {
-    for (int round = 0; round < 200; round++)
+    for (int round = 0; round < 400; round++)
     {
         pollfd p = {.fd = fd, .events = POLLIN};
         if (poll(&p, 1, 0) <= 0)
         {
-            pump(h, 10);
+            pump(h, 5);
             continue;
         }
-        char buffer[4096];
+        char buffer[16384];
         ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
         if (n == 0 || (n < 0 && errno == ECONNRESET))
         {
@@ -123,15 +162,17 @@ static bool client_sees_eof(Harness* h, int fd)
     return false;
 }
 
-static const char REQUEST[] =
-    "GET /signal HTTP/1.1\r\n"
-    "Host: localhost\r\n"
-    "Upgrade: websocket\r\n"
-    "Connection: Upgrade\r\n"
-    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-    "Sec-WebSocket-Version: 13\r\n"
-    "Sec-WebSocket-Protocol: multitap-beacon.1\r\n"
-    "\r\n";
+static std::string request(const char* extra_headers)
+{
+    return std::string("GET /signal HTTP/1.1\r\n"
+                       "Host: localhost\r\n"
+                       "Upgrade: websocket\r\n"
+                       "Connection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n"
+                       "Sec-WebSocket-Protocol: multitap-beacon.1\r\n") +
+           extra_headers + "\r\n";
+}
 
 static const char RESPONSE[] =
     "HTTP/1.1 101 Switching Protocols\r\n"
@@ -141,16 +182,33 @@ static const char RESPONSE[] =
     "Sec-WebSocket-Protocol: multitap-beacon.1\r\n"
     "\r\n";
 
-static int client_open(Harness* h)
+// Connects and handshakes; returns the socket, or -1 if the server didn't
+// answer 101 (then `status` gets the start of what it answered).
+static int client_open_with(Harness* h, const char* extra_headers, std::string* status)
 {
-    int fd = client_connect(h);
+    int fd = client_connect(h, 0);
     if (fd < 0)
     {
         return -1;
     }
-    client_send(h, fd, REQUEST);
+    client_send(h, fd, request(extra_headers));
     std::string response = client_read(h, fd, sizeof(RESPONSE) - 1);
-    check(response == RESPONSE, "the server answers 101 with the accept key and the subprotocol");
+    if (response != RESPONSE)
+    {
+        if (status != nullptr)
+        {
+            *status = response.substr(0, 12);
+        }
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int client_open(Harness* h)
+{
+    int fd = client_open_with(h, "", nullptr);
+    check(fd >= 0, "the server answers 101 with the accept key and the subprotocol");
     return fd;
 }
 
@@ -194,32 +252,98 @@ static std::string server_frame(uint8_t first, const std::string& payload)
     return frame + payload;
 }
 
-int main()
+static BeaconId room_id(uint8_t seed)
+{
+    BeaconId id;
+    for (uint32_t i = 0; i < BEACON_ID_SIZE; i++)
+    {
+        id.bytes[i] = static_cast<uint8_t>(seed * 31 + i + 1);
+    }
+    return id;
+}
+
+static std::string encode(const BeaconSignalingMessage* m)
+{
+    uint8_t bytes[BEACON_SIGNALING_MAX_SIZE];
+    uint32_t size = beacon_signaling_encode(m, bytes, sizeof(bytes));
+    return std::string(reinterpret_cast<const char*>(bytes), size);
+}
+
+static std::string join(uint8_t room, BeaconRole role)
+{
+    BeaconSignalingMessage m;
+    m.type = BeaconSignalingType::JOIN;
+    m.room = room_id(room);
+    m.role = role;
+    return client_frame(0x82, encode(&m));
+}
+
+static std::string leave(uint8_t room)
+{
+    BeaconSignalingMessage m;
+    m.type = BeaconSignalingType::LEAVE;
+    m.room = room_id(room);
+    return client_frame(0x82, encode(&m));
+}
+
+static std::string signal_message(uint8_t room, const std::string& blob)
+{
+    BeaconSignalingMessage m;
+    m.type = BeaconSignalingType::SIGNAL;
+    m.room = room_id(room);
+    m.blob = reinterpret_cast<const uint8_t*>(blob.data());
+    m.blob_size = static_cast<uint32_t>(blob.size());
+    return encode(&m);
+}
+
+// Reads one server binary frame and decodes it; `raw` gets its payload.
+static bool read_message(Harness* h, int fd, BeaconSignalingMessage* out, std::string* raw)
+{
+    std::string head = client_read(h, fd, 2);
+    if (head.size() != 2 || static_cast<uint8_t>(head[0]) != 0x82)
+    {
+        return false;
+    }
+    size_t length = static_cast<uint8_t>(head[1]);
+    if (length == 126)
+    {
+        std::string extended = client_read(h, fd, 2);
+        if (extended.size() != 2)
+        {
+            return false;
+        }
+        length = (static_cast<size_t>(static_cast<uint8_t>(extended[0])) << 8) | static_cast<uint8_t>(extended[1]);
+    }
+    *raw = client_read(h, fd, length);
+    return raw->size() == length &&
+           beacon_signaling_decode(reinterpret_cast<const uint8_t*>(raw->data()), raw->size(), out);
+}
+
+static bool expect(Harness* h, int fd, BeaconSignalingType type, uint8_t room)
+{
+    BeaconSignalingMessage m;
+    std::string raw;
+    BeaconId id = room_id(room);
+    return read_message(h, fd, &m, &raw) && m.type == type && beacon_id_equal(&m.room, &id);
+}
+
+static bool expect_joined(Harness* h, int fd, uint8_t room, uint8_t present)
+{
+    BeaconSignalingMessage m;
+    std::string raw;
+    BeaconId id = room_id(room);
+    return read_message(h, fd, &m, &raw) && m.type == BeaconSignalingType::JOINED && beacon_id_equal(&m.room, &id) &&
+           m.peer_present == present;
+}
+
+static void test_websocket_basics()
 {
     Harness h;
-    h.epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     BeaconSignalConfig config = {};
     config.max_connections = 4;
-    check(beacon_signal_open(&h.signal, &config, "127.0.0.1", 0, h.epoll_fd), "signaling listener opens");
+    check(harness_open(&h, &config), "signaling listener opens");
 
-    // Echo: one frame, a frame sent a byte at a time, the largest frame.
     int fd = client_open(&h);
-    client_send(&h, fd, client_frame(0x82, "hello"));
-    check(client_read(&h, fd, 7) == server_frame(0x82, "hello"), "a binary message comes back unmasked");
-    std::string split = client_frame(0x82, "split across many TCP segments");
-    for (size_t i = 0; i < split.size(); i++)
-    {
-        client_send(&h, fd, split.substr(i, 1));
-    }
-    std::string expected = server_frame(0x82, "split across many TCP segments");
-    check(client_read(&h, fd, expected.size()) == expected, "a frame sent a byte at a time");
-    std::string big(BEACON_WS_MAX_PAYLOAD, 'b');
-    big[100] = 'x';
-    client_send(&h, fd, client_frame(0x82, big) + client_frame(0x82, "next"));
-    expected = server_frame(0x82, big) + server_frame(0x82, "next");
-    check(client_read(&h, fd, expected.size()) == expected, "the largest message and one after it in one write");
-
-    // Ping / pong, then the close handshake.
     client_send(&h, fd, client_frame(0x89, "are you there"));
     check(client_read(&h, fd, 15) == server_frame(0x8a, "are you there"), "ping gets pong with its payload");
     client_send(&h, fd, client_frame(0x8a, ""));   // an unsolicited pong is ignored
@@ -229,40 +353,45 @@ int main()
     close(fd);
 
     // Protocol errors close with a code.
-    fd = client_open(&h);
-    client_send(&h, fd, client_frame(0x81, "text"));
-    check(client_read(&h, fd, 4) == server_frame(0x88, std::string("\x03\xeb", 2)), "a text frame: close 1003");
-    check(client_sees_eof(&h, fd), "and the socket closes");
-    close(fd);
-    fd = client_open(&h);
-    client_send(&h, fd, std::string("\x82\xff", 2));
-    check(client_read(&h, fd, 4) == server_frame(0x88, std::string("\x03\xf1", 2)), "a 64-bit length: close 1009");
-    close(fd);
-    fd = client_open(&h);
-    client_send(&h, fd, std::string("\x82\x02hi", 4));
-    check(client_read(&h, fd, 4) == server_frame(0x88, std::string("\x03\xea", 2)), "an unmasked frame: close 1002");
-    close(fd);
+    struct Case
+    {
+        std::string frame;
+        uint16_t code;
+        const char* what;
+    };
+    BeaconSignalingMessage joined;
+    joined.type = BeaconSignalingType::JOINED;
+    joined.room = room_id(1);
+    const Case cases[] = {
+        {client_frame(0x81, "text"), 1003, "a text frame: close 1003"},
+        {std::string("\x82\xff", 2), 1009, "a 64-bit length: close 1009"},
+        {std::string("\x82\x02hi", 4), 1002, "an unmasked frame: close 1002"},
+        {client_frame(0x82, "not a message"), 1002, "a binary message that isn't a signaling message: 1002"},
+        {client_frame(0x82, encode(&joined)), 1002, "a server-only type from a client: 1002"},
+    };
+    for (const Case& c : cases)
+    {
+        fd = client_open(&h);
+        client_send(&h, fd, c.frame);
+        std::string expected = server_frame(0x88, std::string{static_cast<char>(c.code >> 8), static_cast<char>(c.code & 0xff)});
+        check(client_read(&h, fd, 4) == expected, c.what);
+        check(client_sees_eof(&h, fd), "and the socket closes");
+        close(fd);
+    }
 
-    // A bad handshake gets 400 and the socket closes.
-    fd = client_connect(&h);
-    std::string bad = REQUEST;
+    // A bad handshake gets 400; TLS on the plain port too.
+    fd = client_connect(&h, 0);
+    std::string bad = request("");
     bad.replace(bad.find("multitap-beacon.1"), 17, "chat");
     client_send(&h, fd, bad);
-    std::string response = client_read(&h, fd, 12);
-    check(response == "HTTP/1.1 400", "no subprotocol: 400");
+    check(client_read(&h, fd, 12) == "HTTP/1.1 400", "no subprotocol: 400");
     check(client_sees_eof(&h, fd), "and the socket closes");
     close(fd);
-    // A peer that sends junk instead of GET is refused at once.
-    fd = client_connect(&h);
-    client_send(&h, fd, "\x16\x03\x01");   // a TLS ClientHello: TLS must end at the proxy
+    fd = client_connect(&h, 0);
+    client_send(&h, fd, "\x16\x03\x01");
     check(client_read(&h, fd, 12) == "HTTP/1.1 400", "TLS on the plain port: 400");
     close(fd);
-
-    // Let the server see every close before counting.
-    for (int i = 0; i < 20; i++)
-    {
-        pump(&h, 10);
-    }
+    pump_a_while(&h);
     check(h.signal.stats.open == 0, "every connection was freed");
 
     // The pool holds 4: the fifth is closed at once.
@@ -271,40 +400,319 @@ int main()
     {
         fds[i] = client_open(&h);
     }
-    fds[4] = client_connect(&h);
+    fds[4] = client_connect(&h, 0);
     check(client_sees_eof(&h, fds[4]), "a connection over the pool is closed");
     check(h.signal.stats.refused_full == 1, "and counted");
     close(fds[4]);
 
-    // Timeouts: one connection idle, one in the middle of its handshake.
+    // Timeouts: one connection in the middle of its handshake, then idle ones.
     close(fds[3]);
     pump(&h, 50);
-    fds[3] = client_connect(&h);
+    fds[3] = client_connect(&h, 0);
     client_send(&h, fds[3], "GET / HTTP/1.1\r\nHost: x\r\n");
     h.now += BEACON_SIGNAL_HANDSHAKE_MS;
     beacon_signal_tick(&h.signal, h.now);
     check(client_sees_eof(&h, fds[3]), "an unfinished handshake times out");
-    // fds[0..2] have sent nothing since their handshake.
     client_send(&h, fds[0], client_frame(0x89, ""));
     check(client_read(&h, fds[0], 2) == server_frame(0x8a, ""), "a ping keeps a connection alive");
     h.now += BEACON_SIGNAL_IDLE_MS - BEACON_SIGNAL_HANDSHAKE_MS;
     beacon_signal_tick(&h.signal, h.now);
     check(client_read(&h, fds[1], 4) == server_frame(0x88, std::string("\x03\xe9", 2)), "idle: close 1001");
     check(client_sees_eof(&h, fds[1]), "and the socket closes");
-    client_send(&h, fds[0], client_frame(0x82, "alive"));
-    check(client_read(&h, fds[0], 7) == server_frame(0x82, "alive"), "the pinged connection is still open");
+    client_send(&h, fds[0], client_frame(0x89, "alive"));
+    check(client_read(&h, fds[0], 7) == server_frame(0x8a, "alive"), "the pinged connection is still open");
     for (int i = 0; i < 4; i++)
     {
         close(fds[i]);
     }
-    for (int i = 0; i < 20; i++)
-    {
-        pump(&h, 10);
-    }
+    pump_a_while(&h);
     check(h.signal.stats.open == 0, "every connection was freed at the end");
+    harness_close(&h);
+}
 
-    beacon_signal_close(&h.signal);
-    close(h.epoll_fd);
+static void test_rooms()
+{
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.message_burst = 200;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int host = client_open(&h);
+    int client = client_open(&h);
+
+    client_send(&h, host, join(1, BeaconRole::HOST));
+    check(expect_joined(&h, host, 1, 0), "the host joins an empty room");
+    client_send(&h, client, join(1, BeaconRole::CLIENT));
+    check(expect_joined(&h, client, 1, 1), "the client joins: the host is there");
+    check(expect(&h, host, BeaconSignalingType::PEER_JOINED, 1), "the host hears PEER_JOINED");
+    check(h.signal.stats.rooms == 1, "one room");
+
+    // SIGNAL is passed along byte for byte, both ways, up to the largest blob.
+    std::string offer = signal_message(1, "encrypted offer");
+    client_send(&h, client, client_frame(0x82, offer));
+    BeaconSignalingMessage m;
+    std::string raw;
+    check(read_message(&h, host, &m, &raw) && m.type == BeaconSignalingType::SIGNAL && raw == offer,
+          "the host gets the client's SIGNAL as is");
+    std::string answer = signal_message(1, std::string(BEACON_SIGNALING_MAX_BLOB, 'a'));
+    client_send(&h, host, client_frame(0x82, answer));
+    check(read_message(&h, client, &m, &raw) && raw == answer, "the client gets the host's largest SIGNAL");
+
+    // The host's keepalive JOIN: JOINED again, nothing for the client.
+    client_send(&h, host, join(1, BeaconRole::HOST));
+    check(expect_joined(&h, host, 1, 1), "a repeated JOIN refreshes");
+    check(client_quiet(&h, client), "the client hears nothing about a refresh");
+
+    // A second client socket for the same side replaces the first.
+    int client2 = client_open(&h);
+    client_send(&h, client2, join(1, BeaconRole::CLIENT));
+    check(expect_joined(&h, client2, 1, 1), "the new client socket joins");
+    check(expect(&h, client, BeaconSignalingType::LEFT, 1), "the old one gets LEFT");
+    check(expect(&h, host, BeaconSignalingType::PEER_JOINED, 1), "the host hears PEER_JOINED again");
+    check(h.signal.stats.replaced == 1, "the replacement is counted");
+    client_send(&h, client, client_frame(0x82, offer));
+    check(expect(&h, client, BeaconSignalingType::NOT_FOUND, 1), "the replaced socket's SIGNAL: NOT_FOUND");
+    check(client_quiet(&h, host), "and it doesn't reach the host");
+
+    // LEAVE: the other side hears LEFT; SIGNAL after it: NOT_FOUND.
+    client_send(&h, client2, leave(1));
+    check(expect(&h, host, BeaconSignalingType::LEFT, 1), "LEAVE: the host gets LEFT");
+    client_send(&h, client2, client_frame(0x82, offer));
+    check(expect(&h, client2, BeaconSignalingType::NOT_FOUND, 1), "SIGNAL after LEAVE: NOT_FOUND");
+    client_send(&h, host, client_frame(0x82, answer));
+    check(expect(&h, host, BeaconSignalingType::NOT_FOUND, 1), "SIGNAL with no client: NOT_FOUND");
+
+    // A client alone in a room: NOT_FOUND (the host is offline).
+    client_send(&h, client, join(2, BeaconRole::CLIENT));
+    check(expect_joined(&h, client, 2, 0), "a client joins a room with no host");
+    client_send(&h, client, client_frame(0x82, signal_message(2, "offer")));
+    check(expect(&h, client, BeaconSignalingType::NOT_FOUND, 2), "host offline: NOT_FOUND");
+    client_send(&h, client, client_frame(0x82, signal_message(3, "offer")));
+    check(expect(&h, client, BeaconSignalingType::NOT_FOUND, 3), "SIGNAL to a room never joined: NOT_FOUND");
+
+    // Closing a socket: the other side hears LEFT; empty rooms are forgotten.
+    client_send(&h, client2, join(1, BeaconRole::CLIENT));
+    check(expect_joined(&h, client2, 1, 1), "the client joins again");
+    check(expect(&h, host, BeaconSignalingType::PEER_JOINED, 1), "the host hears it");
+    close(host);
+    pump_a_while(&h);
+    check(expect(&h, client2, BeaconSignalingType::LEFT, 1), "the host's socket closes: the client gets LEFT");
+    check(h.signal.stats.rooms == 2, "rooms 1 (the client) and 2 are left");
+    close(client2);
+    close(client);
+    pump_a_while(&h);
+    check(h.signal.stats.rooms == 0 && h.signal.stats.open == 0, "every room and connection was freed");
+
+    // One socket can't hold both sides of a room.
+    int both = client_open(&h);
+    client_send(&h, both, join(4, BeaconRole::HOST));
+    check(expect_joined(&h, both, 4, 0), "host side joined");
+    client_send(&h, both, join(4, BeaconRole::CLIENT));
+    check(client_read(&h, both, 4) == server_frame(0x88, std::string("\x03\xf0", 2)), "both sides on one socket: 1008");
+    close(both);
+
+    // 64 rooms per socket.
+    int many = client_open(&h);
+    std::string joins;
+    for (uint32_t i = 0; i < BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION; i++)
+    {
+        joins += join(static_cast<uint8_t>(10 + i), BeaconRole::HOST);
+    }
+    client_send(&h, many, joins);
+    bool all = true;
+    for (uint32_t i = 0; i < BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION; i++)
+    {
+        all = all && expect_joined(&h, many, static_cast<uint8_t>(10 + i), 0);
+    }
+    check(all, "64 rooms on one socket");
+    client_send(&h, many, join(200, BeaconRole::HOST));
+    check(read_message(&h, many, &m, &raw) && m.type == BeaconSignalingType::REFUSED &&
+              m.reason == BeaconRefusal::ROOMS_PER_CONNECTION,
+          "the 65th: REFUSED, too many rooms on this socket");
+    close(many);
+    pump_a_while(&h);
+    check(h.signal.stats.rooms == 0, "its 64 rooms are forgotten when it closes");
+    harness_close(&h);
+
+    // The room table: max_rooms 2.
+    config.max_rooms = 2;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int a = client_open(&h);
+    client_send(&h, a, join(1, BeaconRole::HOST) + join(2, BeaconRole::HOST) + join(3, BeaconRole::HOST));
+    check(expect_joined(&h, a, 1, 0) && expect_joined(&h, a, 2, 0), "two rooms fit");
+    check(read_message(&h, a, &m, &raw) && m.type == BeaconSignalingType::REFUSED &&
+              m.reason == BeaconRefusal::ROOMS_FULL,
+          "the third: REFUSED, room table full");
+    client_send(&h, a, leave(2) + join(3, BeaconRole::HOST));
+    check(expect_joined(&h, a, 3, 0), "after a LEAVE there's room again");
+    close(a);
+    harness_close(&h);
+}
+
+static void test_rate_limits()
+{
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.message_burst = 5;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int fd = client_open(&h);
+    std::string pings;
+    for (int i = 0; i < 6; i++)
+    {
+        pings += client_frame(0x89, "");
+    }
+    client_send(&h, fd, pings);
+    std::string expected;
+    for (int i = 0; i < 5; i++)
+    {
+        expected += server_frame(0x8a, "");
+    }
+    expected += server_frame(0x88, std::string("\x03\xf0", 2));
+    check(client_read(&h, fd, expected.size()) == expected, "a burst of 5, the sixth message: close 1008");
+    close(fd);
+
+    // Bytes: a burst of 8 KiB lets two largest SIGNALs through, not three.
+    harness_close(&h);
+    config.message_burst = 60;
+    config.byte_burst = 8500;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int host = client_open(&h);
+    int client = client_open(&h);
+    client_send(&h, host, join(1, BeaconRole::HOST));
+    client_send(&h, client, join(1, BeaconRole::CLIENT));
+    check(expect_joined(&h, host, 1, 0) && expect_joined(&h, client, 1, 1), "both joined");
+    std::string big = client_frame(0x82, signal_message(1, std::string(4000, 'x')));
+    client_send(&h, client, big + big + big);
+    BeaconSignalingMessage m;
+    std::string raw;
+    check(expect(&h, host, BeaconSignalingType::PEER_JOINED, 1), "the host heard PEER_JOINED");
+    check(read_message(&h, host, &m, &raw) && read_message(&h, host, &m, &raw), "two big SIGNALs pass");
+    check(client_read(&h, client, 4) == server_frame(0x88, std::string("\x03\xf0", 2)), "the third: close 1008");
+    check(h.signal.stats.rate_limited == 1, "the rate limit is counted");
+    close(host);
+    close(client);
+    harness_close(&h);
+}
+
+static void test_sources()
+{
+    // CIDR parsing and matching.
+    BeaconCidr cidr;
+    BeaconAddress inside = {};
+    inside.ip[10] = 0xff;
+    inside.ip[11] = 0xff;
+    inside.ip[12] = 172;
+    inside.ip[13] = 20;
+    inside.ip[14] = 1;
+    inside.ip[15] = 2;
+    BeaconAddress outside = inside;
+    outside.ip[13] = 32;
+    check(beacon_cidr_parse("172.16.0.0/12", &cidr) && cidr.prefix == 108, "IPv4 /12 parses (as /108)");
+    check(beacon_cidr_contains(&cidr, &inside) && !beacon_cidr_contains(&cidr, &outside), "172.16/12 matching");
+    check(beacon_cidr_parse("172.20.1.2", &cidr) && cidr.prefix == 128 && beacon_cidr_contains(&cidr, &inside),
+          "a bare IPv4 address is a /32");
+    check(beacon_cidr_parse("fd00::/8", &cidr) && cidr.prefix == 8, "IPv6 /8 parses");
+    check(!beacon_cidr_parse("172.16.0.0/33", &cidr), "/33 is refused for IPv4");
+    check(!beacon_cidr_parse("fd00::/129", &cidr), "/129 is refused");
+    check(!beacon_cidr_parse("example.org", &cidr), "a name is refused");
+    check(!beacon_cidr_parse("10.0.0.0/", &cidr) && !beacon_cidr_parse("10.0.0.0/8x", &cidr), "a bad prefix");
+
+    // Two connections per source. Behind the (loopback, so trusted) proxy,
+    // the source is X-Forwarded-For's address; IPv6 counts by /64.
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.max_connections_per_source = 2;
+    check(harness_open(&h, &config), "signaling listener opens");
+    std::string status;
+    int direct[2] = {client_open(&h), client_open(&h)};
+    check(client_open_with(&h, "", &status) < 0 && status == "HTTP/1.1 429", "a third from 127.0.0.1: 429");
+    int a1 = client_open_with(&h, "X-Forwarded-For: 198.51.100.1\r\n", nullptr);
+    int a2 = client_open_with(&h, "X-Forwarded-For: 10.9.9.9, 198.51.100.1\r\n", nullptr);
+    check(a1 >= 0 && a2 >= 0, "two from 198.51.100.1 behind the proxy");
+    check(client_open_with(&h, "X-Forwarded-For: 198.51.100.1\r\n", &status) < 0 && status == "HTTP/1.1 429",
+          "a third from 198.51.100.1: 429");
+    int b1 = client_open_with(&h, "X-Forwarded-For: 198.51.100.2\r\n", nullptr);
+    check(b1 >= 0, "another address is its own source");
+    int c1 = client_open_with(&h, "X-Forwarded-For: 2001:db8:1:2::1\r\n", nullptr);
+    int c2 = client_open_with(&h, "X-Forwarded-For: 2001:db8:1:2::ffff\r\n", nullptr);
+    check(c1 >= 0 && c2 >= 0, "two from one IPv6 /64");
+    check(client_open_with(&h, "X-Forwarded-For: 2001:db8:1:2:aaaa::1\r\n", &status) < 0 && status == "HTTP/1.1 429",
+          "a third from the same /64: 429");
+    int d1 = client_open_with(&h, "X-Forwarded-For: 2001:db8:1:3::1\r\n", nullptr);
+    check(d1 >= 0, "the next /64 is another source");
+    check(h.signal.stats.refused_source == 3, "429s are counted");
+    int fds[] = {direct[0], direct[1], a1, a2, b1, c1, c2, d1};
+    for (int fd : fds)
+    {
+        close(fd);
+    }
+    pump_a_while(&h);
+    harness_close(&h);
+}
+
+static void test_slow_reader()
+{
+    // The host stops reading: once its buffers fill, it's closed, and the
+    // client gets NOT_FOUND (and LEFT when the host is freed).
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.message_burst = 100000;
+    config.messages_per_second = 100000;
+    config.byte_burst = 100000000;
+    config.bytes_per_second = 100000000;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int host = client_connect(&h, 4096);
+    client_send(&h, host, request(""));
+    check(client_read(&h, host, sizeof(RESPONSE) - 1) == RESPONSE, "the host handshakes");
+    int client = client_open(&h);
+    client_send(&h, host, join(1, BeaconRole::HOST));
+    client_send(&h, client, join(1, BeaconRole::CLIENT));
+    std::string big = client_frame(0x82, signal_message(1, std::string(4096, 's')));
+    bool not_found = false;
+    bool left = false;
+    for (int i = 0; i < 2000 && !not_found; i++)
+    {
+        client_send(&h, client, big);
+        // Read what the client is sent, looking for NOT_FOUND.
+        for (;;)
+        {
+            pollfd p = {.fd = client, .events = POLLIN};
+            if (poll(&p, 1, 0) <= 0)
+            {
+                break;
+            }
+            BeaconSignalingMessage m;
+            std::string raw;
+            if (!read_message(&h, client, &m, &raw))
+            {
+                break;
+            }
+            if (m.type == BeaconSignalingType::NOT_FOUND)
+            {
+                not_found = true;
+            }
+            if (m.type == BeaconSignalingType::LEFT)
+            {
+                left = true;
+            }
+        }
+    }
+    check(not_found, "a host that doesn't read: the client gets NOT_FOUND");
+    check(h.signal.stats.slow_readers >= 1, "the slow reader is counted");
+    pump_a_while(&h);
+    check(left || expect(&h, client, BeaconSignalingType::LEFT, 1), "and LEFT once the host is dropped");
+    check(client_sees_eof(&h, host), "the host's socket is closed");
+    close(host);
+    close(client);
+    harness_close(&h);
+}
+
+int main()
+{
+    test_websocket_basics();
+    test_rooms();
+    test_rate_limits();
+    test_sources();
+    test_slow_reader();
     if (g_failures != 0)
     {
         fprintf(stderr, "%u failures\n", g_failures);

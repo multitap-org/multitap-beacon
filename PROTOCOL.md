@@ -120,12 +120,83 @@ default; that socket answers STUN and nothing else).
   (44 / 20). That's what every public STUN server does; the per-source token bucket and the
   overflow bucket cap what any one spoofed address can receive.
 
+## Signaling (WebRTC)
+
+For browsers, which can't send raw UDP: a WebSocket listener carries the WebRTC offer, answer
+and ICE candidates between two peers that know the same meeting id. beacon passes them along
+without reading them; the peers then connect directly (ICE, with beacon as their STUN server).
+There is no relay here either: if ICE fails, the client says "couldn't connect".
+
+### Transport
+
+- WebSocket (RFC 6455) on TCP 55432, bound to 127.0.0.1 by default. beacon never does TLS: a
+  proxy (Caddy, Nginx Proxy Manager) serves it as `wss://<beacon>/signal` (any path). Browsers on
+  an https page refuse plain ws://, so the proxy is required for any browser use.
+- The client opens it with the subprotocol `multitap-beacon.1`
+  (`new WebSocket(url, "multitap-beacon.1")`); a handshake without it gets HTTP 400.
+- Strict subset: binary messages only, one frame each (no fragmentation), masked, no
+  extensions (permessage-deflate is declined), lengths up to 4120 bytes in the 7-bit or 16-bit
+  form. Text, continuation, a 64-bit length or a broken rule close the socket (1003, 1002 or
+  1009). Ping gets pong; close is echoed.
+- Timeouts: 5 s to finish the handshake; a socket that sends no frame for 60 s is closed (1001).
+  A host re-sends its JOINs every 20 s, which also keeps the socket open.
+
+### Messages
+
+One binary WebSocket message = one message, with the same 8-byte header as UDP (`"MTBC"`,
+version 1, type, two zero bytes) and types from 16 up (they never decode as UDP messages, nor
+the reverse). Room = a meeting id (16 bytes, never zero). Every type has one fixed size except
+SIGNAL, whose blob size is the WebSocket message's size minus 24 (never a field).
+
+| type | name | dir | total | body |
+|---|---|---|---|---|
+| 16 | JOIN | c->s | 28 | 8 room (16), 24 role (1 = host, 2 = client), 25 zero (3) |
+| 17 | JOINED | s->c | 28 | 8 room (16), 24 other side present (0 / 1), 25 zero (3) |
+| 18 | LEAVE | c->s | 24 | 8 room (16) |
+| 19 | PEER_JOINED | s->c | 24 | 8 room (16) |
+| 20 | LEFT | s->c | 24 | 8 room (16) |
+| 21 | SIGNAL | both | 25-4120 | 8 room (16), 24 blob (1-4096 bytes) |
+| 22 | NOT_FOUND | s->c | 24 | 8 room (16) |
+| 23 | REFUSED | s->c | 28 | 8 room (16), 24 reason (1 = too many rooms on this socket, 2 = room table full), 25 zero (3) |
+
+- A room holds one host socket and one client socket. **JOIN** puts the socket on its role's
+  side and answers JOINED (with whether the other side is there); the other side, if present,
+  gets PEER_JOINED. JOIN again from the same socket refreshes it (the host's keepalive). JOIN
+  for a side another socket holds **replaces** it (a reconnect before the old socket timed
+  out): the old socket gets LEFT and leaves the room, and the other side gets PEER_JOINED again
+  (start over). One socket can't hold both sides of a room (closed, 1008).
+- **SIGNAL** from a socket in the room goes to the other side byte for byte (the whole message,
+  header included). With no one on the other side, or from a socket not in the room:
+  NOT_FOUND (the client maps it to "host offline", as on UDP).
+- **LEAVE**, or the socket closing, takes it out of its rooms; the other side gets LEFT. A room
+  with nobody left is forgotten.
+- Over a limit, JOIN gets REFUSED (nothing changes). Any other client message that doesn't
+  decode, or a server-only type, closes the socket (1002).
+- **Blobs are end-to-end encrypted by the peers** (beacon never sees SDP or candidates, so
+  never the peers' IPs from them): `crypto_aead_lock` (XChaCha20-Poly1305), a random 24-byte
+  nonce per blob, the direction (host to client / client to host) in the associated data, key
+  = BLAKE2b("multitap signal v1" || X25519(own, other)). 40 bytes of overhead; a data-channel
+  SDP is 0.5-1 KiB, so 4096 is plenty. Tampering only breaks the connection; Noise XX
+  authenticates afterwards anyway. (The pairing room, which has no shared key yet, is the one
+  plain-text case: see the netcode notes.)
+
+### Limits
+
+Per socket: 64 rooms; 20 messages per second (burst 60) and 16 KiB per second (burst 64 KiB);
+over a rate, the socket closes (1008). Per source (IPv4 address or IPv6 /64): 8 sockets; more
+get HTTP 429 at the handshake. 1024 sockets and 65536 rooms in total. All are options.
+
+The source is the TCP peer, or, when the peer is a trusted proxy (`--trusted-proxy`; loopback
+always), the last address of the handshake's last `X-Forwarded-For` header. Caddy sets that
+header to the client's address (it ignores what clients send unless told to trust them).
+
 ## Security notes
 
 - The server never parses anything variable: every message is a fixed struct, checked field by
-  field. Fuzzed (libFuzzer) with a decode -> encode round-trip check. The one exception is STUN's
-  attribute list, which is only walked to check that it fits (bounded, every step checked
-  against the end) and is fuzzed on its own.
+  field. Fuzzed (libFuzzer) with a decode -> encode round-trip check. The exceptions, each
+  fuzzed on its own: STUN's attribute list (only walked to check that it fits), the WebSocket
+  handshake (HTTP headers, at most 4 KiB, strict) and frames, and SIGNAL's blob (never read:
+  its length comes from the frame, capped at 4096).
 - The server is not authenticated in v1 (phase 2: signed directory). A spoofed INTRO can at
   most make a peer send PUNCHes (32 bytes, 50 of them) to some address, and only for an id the
   peer has registered or asked for.
@@ -137,7 +208,10 @@ default; that socket answers STUN and nothing else).
 - One small C++20 binary (STYLE.md: C-like, no auto / lambdas / templates / exceptions), only
   libc + sockets (Linux; other POSIX / Windows later if cheap) + Monocypher (submodule) for the
   cookie and table hashing. Wire format in its own small library (`beacon_wire.h/.cpp`,
-  no dependencies) that frontends-common will also use (submodule in piccolo's deps/).
+  no dependencies) that frontends-common will also use (submodule in piccolo's deps/); it has
+  the signaling messages too (`beacon_signaling_encode` / `_decode`). One epoll loop serves the
+  UDP sockets and the WebSocket listener (fixed connection pool and room table, allocated at
+  start).
 - Command line: ports, bind address, table sizes, per-source limits, log level, and
   `--public-address` for a server behind a NAT with port forwarding: senders with private
   addresses (its own LAN, through NAT loopback) are reported with that public IP and their
@@ -146,7 +220,8 @@ default; that socket answers STUN and nothing else).
 - Ships: README (self-hosting in 5 minutes), systemd unit, Dockerfile, tests (unit + a loopback
   end-to-end: two fake peers register/meet and get each other's address), a libFuzzer target for
   the parser, builds clean with -Wall -Wextra -Werror and ASan/UBSan.
-- Default server for piccolo: domain still to be decided by Andrés.
+- Default server for piccolo: domain still to be decided by Andrés (the WebRTC plan uses
+  beacon.get-piccolo.app: STUN on 55430, signaling at wss://beacon.get-piccolo.app/signal).
 
 ## Changes from the first draft
 
@@ -167,3 +242,5 @@ default; that socket answers STUN and nothing else).
 - REGISTER and MEET must come from the ENet socket; SECONDARY answers BIND only.
 - STUN Binding (for browsers) on PRIMARY and SECONDARY, and on an optional STUN-only port;
   the one reply larger than its request (2026-11-20, WebRTC plan step 2).
+- Signaling over WebSocket (types 16-23, rooms with a role byte, end-to-end encrypted blobs),
+  2026-11-20, WebRTC plan step 3.

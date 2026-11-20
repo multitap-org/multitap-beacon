@@ -394,3 +394,165 @@ uint32_t beacon_encode(const BeaconMessage* message, uint8_t* out, size_t capaci
     }
     return size;
 }
+
+// ---------------------------------------------------------------------------
+// Signaling
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t OFFSET_ROOM = 8;
+static constexpr uint32_t OFFSET_ROOM_END = 24;    // JOIN's role, JOINED's flag, REFUSED's reason, SIGNAL's blob
+static constexpr uint32_t OFFSET_ROOM_PAD = 25;    // 3 zero bytes after that byte
+static_assert(OFFSET_ROOM + BEACON_ID_SIZE == OFFSET_ROOM_END, "room layout");
+static_assert(OFFSET_ROOM_END == BEACON_SIGNALING_SIZE_ROOM, "room-only layout");
+static_assert(OFFSET_ROOM_PAD + 3 == BEACON_SIGNALING_SIZE_JOIN, "JOIN layout");
+static_assert(OFFSET_ROOM_END == BEACON_SIGNALING_SIGNAL_HEADER, "SIGNAL layout");
+
+static uint32_t signaling_fixed_size(uint8_t type)
+{
+    switch (type)
+    {
+        case static_cast<uint8_t>(BeaconSignalingType::JOIN):
+            return BEACON_SIGNALING_SIZE_JOIN;
+        case static_cast<uint8_t>(BeaconSignalingType::JOINED):
+            return BEACON_SIGNALING_SIZE_JOINED;
+        case static_cast<uint8_t>(BeaconSignalingType::REFUSED):
+            return BEACON_SIGNALING_SIZE_REFUSED;
+        case static_cast<uint8_t>(BeaconSignalingType::LEAVE):
+        case static_cast<uint8_t>(BeaconSignalingType::PEER_JOINED):
+        case static_cast<uint8_t>(BeaconSignalingType::LEFT):
+        case static_cast<uint8_t>(BeaconSignalingType::NOT_FOUND):
+            return BEACON_SIGNALING_SIZE_ROOM;
+        default:
+            return 0;   // SIGNAL (variable) or not a signaling type
+    }
+}
+
+bool beacon_signaling_decode(const uint8_t* data, size_t size, BeaconSignalingMessage* out)
+{
+    *out = BeaconSignalingMessage{};
+    if (size < BEACON_SIGNALING_SIZE_ROOM || memcmp(data, MAGIC, 4) != 0 || data[4] != BEACON_VERSION ||
+        data[6] != 0 || data[7] != 0)
+    {
+        return false;
+    }
+    uint8_t type = data[5];
+    if (type == static_cast<uint8_t>(BeaconSignalingType::SIGNAL))
+    {
+        if (size <= BEACON_SIGNALING_SIGNAL_HEADER || size > BEACON_SIGNALING_MAX_SIZE)
+        {
+            return false;
+        }
+        out->blob = data + BEACON_SIGNALING_SIGNAL_HEADER;
+        out->blob_size = static_cast<uint32_t>(size - BEACON_SIGNALING_SIGNAL_HEADER);
+    }
+    else
+    {
+        uint32_t expected = signaling_fixed_size(type);
+        if (expected == 0 || size != expected)
+        {
+            return false;
+        }
+    }
+    memcpy(out->room.bytes, data + OFFSET_ROOM, BEACON_ID_SIZE);
+    if (beacon_id_is_zero(&out->room))
+    {
+        return false;
+    }
+    out->type = static_cast<BeaconSignalingType>(type);
+    switch (out->type)
+    {
+        case BeaconSignalingType::JOIN:
+            if (data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRole::HOST) &&
+                data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRole::CLIENT))
+            {
+                return false;
+            }
+            out->role = static_cast<BeaconRole>(data[OFFSET_ROOM_END]);
+            return all_zero(data + OFFSET_ROOM_PAD, 3);
+        case BeaconSignalingType::JOINED:
+            if (data[OFFSET_ROOM_END] > 1)
+            {
+                return false;
+            }
+            out->peer_present = data[OFFSET_ROOM_END];
+            return all_zero(data + OFFSET_ROOM_PAD, 3);
+        case BeaconSignalingType::REFUSED:
+            if (data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRefusal::ROOMS_PER_CONNECTION) &&
+                data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRefusal::ROOMS_FULL))
+            {
+                return false;
+            }
+            out->reason = static_cast<BeaconRefusal>(data[OFFSET_ROOM_END]);
+            return all_zero(data + OFFSET_ROOM_PAD, 3);
+        default:
+            return true;
+    }
+}
+
+uint32_t beacon_signaling_encode(const BeaconSignalingMessage* message, uint8_t* out, size_t capacity)
+{
+    uint8_t type = static_cast<uint8_t>(message->type);
+    uint32_t size = 0;
+    if (message->type == BeaconSignalingType::SIGNAL)
+    {
+        if (message->blob == nullptr || message->blob_size < 1 || message->blob_size > BEACON_SIGNALING_MAX_BLOB)
+        {
+            return 0;
+        }
+        size = BEACON_SIGNALING_SIGNAL_HEADER + message->blob_size;
+    }
+    else
+    {
+        size = signaling_fixed_size(type);
+    }
+    if (size == 0 || capacity < size || beacon_id_is_zero(&message->room))
+    {
+        return 0;
+    }
+    switch (message->type)
+    {
+        case BeaconSignalingType::JOIN:
+            if (message->role != BeaconRole::HOST && message->role != BeaconRole::CLIENT)
+            {
+                return 0;
+            }
+            break;
+        case BeaconSignalingType::JOINED:
+            if (message->peer_present > 1)
+            {
+                return 0;
+            }
+            break;
+        case BeaconSignalingType::REFUSED:
+            if (message->reason != BeaconRefusal::ROOMS_PER_CONNECTION && message->reason != BeaconRefusal::ROOMS_FULL)
+            {
+                return 0;
+            }
+            break;
+        default:
+            break;
+    }
+    memset(out, 0, size);
+    memcpy(out, MAGIC, 4);
+    out[4] = BEACON_VERSION;
+    out[5] = type;
+    memcpy(out + OFFSET_ROOM, message->room.bytes, BEACON_ID_SIZE);
+    switch (message->type)
+    {
+        case BeaconSignalingType::JOIN:
+            out[OFFSET_ROOM_END] = static_cast<uint8_t>(message->role);
+            break;
+        case BeaconSignalingType::JOINED:
+            out[OFFSET_ROOM_END] = message->peer_present;
+            break;
+        case BeaconSignalingType::REFUSED:
+            out[OFFSET_ROOM_END] = static_cast<uint8_t>(message->reason);
+            break;
+        case BeaconSignalingType::SIGNAL:
+            memcpy(out + BEACON_SIGNALING_SIGNAL_HEADER, message->blob, message->blob_size);
+            break;
+        default:
+            break;
+    }
+    return size;
+}

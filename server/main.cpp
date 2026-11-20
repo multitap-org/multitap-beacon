@@ -76,6 +76,11 @@ static void print_usage(FILE* out)
             "                            a TLS proxy such as Caddy goes in front)\n"
             "  --signal-port N           its TCP port, 0 = no signaling (default %u)\n"
             "  --max-connections N       signaling connections at once (default %" PRIu32 ")\n"
+            "  --max-rooms N             signaling rooms at once (default %" PRIu32 ")\n"
+            "  --max-connections-per-source N\n"
+            "                            signaling connections from one IPv4 address or IPv6 /64 (default %" PRIu32 ")\n"
+            "  --trusted-proxy IP[/N]    a proxy whose X-Forwarded-For is believed, e.g. a Docker network\n"
+            "                            (172.16.0.0/12); loopback always is; up to 8 times\n"
             "  --public-address IP       the server's public IPv4 or IPv6 address, for a server behind a NAT\n"
             "                            with port forwarding: senders from private addresses are reported\n"
             "                            with it (give it twice for both families; default: off)\n"
@@ -88,7 +93,7 @@ static void print_usage(FILE* out)
             static_cast<unsigned>(DEFAULT_PRIMARY_PORT), static_cast<unsigned>(DEFAULT_SECONDARY_PORT),
             defaults.max_entries, defaults.max_sources, defaults.max_ids_per_source, defaults.rate_per_second,
             defaults.burst, defaults.overflow_rate_per_second, static_cast<unsigned>(DEFAULT_SIGNAL_PORT),
-            signal_defaults.max_connections);
+            signal_defaults.max_connections, signal_defaults.max_rooms, signal_defaults.max_connections_per_source);
 }
 
 // A decimal number in [min, max], nothing else.
@@ -223,6 +228,36 @@ static int parse_options(int argc, char** argv, Options* options)
                 return 1;
             }
         }
+        else if (strcmp(name, "--max-rooms") == 0)
+        {
+            if (!parse_number(name, value, 1, 1u << 24, &options->signal_config.max_rooms))
+            {
+                return 1;
+            }
+        }
+        else if (strcmp(name, "--max-connections-per-source") == 0)
+        {
+            if (!parse_number(name, value, 1, BEACON_SIGNAL_MAX_CONNECTIONS,
+                              &options->signal_config.max_connections_per_source))
+            {
+                return 1;
+            }
+        }
+        else if (strcmp(name, "--trusted-proxy") == 0)
+        {
+            BeaconSignalConfig* signal_config = &options->signal_config;
+            if (signal_config->trusted_count >= BEACON_SIGNAL_MAX_TRUSTED)
+            {
+                fprintf(stderr, "beacon: --trusted-proxy at most %u times\n", BEACON_SIGNAL_MAX_TRUSTED);
+                return 1;
+            }
+            if (!beacon_cidr_parse(value, &signal_config->trusted[signal_config->trusted_count]))
+            {
+                fprintf(stderr, "beacon: --trusted-proxy needs a numeric address or range (IP or IP/N)\n");
+                return 1;
+            }
+            signal_config->trusted_count++;
+        }
         else if (strcmp(name, "--stun-port") == 0)
         {
             if (!parse_number(name, value, 0, 65535, &number))
@@ -321,14 +356,15 @@ static void log_signal_stats(BeaconSignal* signal, uint32_t seconds)
 {
     const BeaconSignalStats* s = &signal->stats;
     beacon_log(BeaconLogLevel::info,
-               "signaling, last %" PRIu32 " s: %" PRIu64 " accepted (%" PRIu64 " refused, pool full), %" PRIu64
-               " handshakes (%" PRIu64 " bad), %" PRIu64 " messages, %" PRIu64 " protocol errors, %" PRIu64
-               " timeouts, %" PRIu64 " slow readers; now %" PRIu32 " open",
-               seconds, s->accepted, s->refused_full, s->handshakes, s->bad_handshakes, s->messages,
-               s->protocol_errors, s->timeouts, s->slow_readers, s->open);
-    uint32_t open = s->open;
-    signal->stats = BeaconSignalStats{};
-    signal->stats.open = open;
+               "signaling, last %" PRIu32 " s: %" PRIu64 " accepted (%" PRIu64 " pool full, %" PRIu64
+               " over source limit), %" PRIu64 " handshakes (%" PRIu64 " bad), %" PRIu64 " joins (%" PRIu64
+               " replaced, %" PRIu64 " refused), %" PRIu64 " signals, %" PRIu64 " not found; closed: %" PRIu64
+               " rate, %" PRIu64 " protocol, %" PRIu64 " timeout, %" PRIu64 " slow; now %" PRIu32 " open, %" PRIu32
+               " rooms",
+               seconds, s->accepted, s->refused_full, s->refused_source, s->handshakes, s->bad_handshakes, s->joins,
+               s->replaced, s->refused_rooms, s->signals, s->not_found, s->rate_limited, s->protocol_errors,
+               s->timeouts, s->slow_readers, s->open, s->rooms);
+    beacon_signal_stats_reset(signal);
 }
 
 static void log_stats(const BeaconServer* server, const BeaconNet* net, uint32_t seconds)
@@ -556,9 +592,11 @@ int main(int argc, char** argv)
         {
             loop.signal = &signal;
             beacon_log(BeaconLogLevel::info,
-                       "signaling: WebSocket on [%s] TCP %u, %" PRIu32 " connections (%" PRIu64 " KiB)",
+                       "signaling: WebSocket on [%s] TCP %u, %" PRIu32 " connections, %" PRIu32 " rooms (%" PRIu64
+                       " KiB), %" PRIu32 " trusted proxies besides loopback",
                        options.signal_bind, static_cast<unsigned>(signal.port),
-                       options.signal_config.max_connections, beacon_signal_pool_bytes(&signal) / 1024);
+                       options.signal_config.max_connections, options.signal_config.max_rooms,
+                       beacon_signal_pool_bytes(&signal) / 1024, options.signal_config.trusted_count);
         }
         else
         {
