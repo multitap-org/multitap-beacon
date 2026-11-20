@@ -1,0 +1,97 @@
+// beacon_wire: the exact byte layout of every beacon message (PROTOCOL.md).
+//
+// Shared by the server and the clients (frontends-common uses this repo as a
+// submodule), so it depends on nothing: no SDL, no sockets, no crypto.
+//
+// Every message type has ONE fixed size. beacon_decode() accepts a packet
+// only when its size is exactly the size of its type and every field rule
+// holds (magic, version, reserved and padding bytes zero, counts in range,
+// ids non-zero, ports non-zero). It never takes a length from the wire.
+// beacon_encode() checks the same rules, so for any packet decode accepts,
+// encode gives back the same bytes (the fuzzer checks this).
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+constexpr uint8_t BEACON_VERSION = 1;
+constexpr uint32_t BEACON_HEADER_SIZE = 8;
+constexpr uint32_t BEACON_ID_SIZE = 16;
+constexpr uint32_t BEACON_COOKIE_SIZE = 16;
+constexpr uint32_t BEACON_ADDRESS_SIZE = 20;
+constexpr uint32_t BEACON_MAX_IDS = 8;
+
+// Total sizes, header included.
+constexpr uint32_t BEACON_SIZE_BIND = 36;
+constexpr uint32_t BEACON_SIZE_BOUND = 36;
+constexpr uint32_t BEACON_SIZE_REGISTER = 164;
+constexpr uint32_t BEACON_SIZE_COOKIE = 32;
+constexpr uint32_t BEACON_SIZE_REGISTERED = 36;
+constexpr uint32_t BEACON_SIZE_MEET = 52;
+constexpr uint32_t BEACON_SIZE_INTRO = 52;
+constexpr uint32_t BEACON_SIZE_NOT_FOUND = 32;
+constexpr uint32_t BEACON_SIZE_PUNCH = 32;
+constexpr uint32_t BEACON_MAX_MESSAGE_SIZE = 164;
+
+// Anti-amplification (PROTOCOL.md): a reply is never larger than its request.
+static_assert(BEACON_SIZE_BOUND <= BEACON_SIZE_BIND, "BOUND must not be larger than BIND");
+static_assert(BEACON_SIZE_COOKIE <= BEACON_SIZE_REGISTER, "COOKIE must not be larger than REGISTER");
+static_assert(BEACON_SIZE_REGISTERED <= BEACON_SIZE_REGISTER, "REGISTERED must not be larger than REGISTER");
+static_assert(BEACON_SIZE_INTRO <= BEACON_SIZE_MEET, "INTRO must not be larger than MEET");
+static_assert(BEACON_SIZE_NOT_FOUND <= BEACON_SIZE_MEET, "NOT_FOUND must not be larger than MEET");
+
+enum class BeaconType : uint8_t
+{
+    BIND = 1,
+    BOUND = 2,
+    REGISTER = 3,
+    COOKIE = 4,
+    REGISTERED = 5,
+    MEET = 6,
+    INTRO = 7,
+    NOT_FOUND = 8,
+    PUNCH = 9,
+};
+
+// An address as the protocol carries it: IPv6 bytes in network order (IPv4 as
+// ::ffff:a.b.c.d) and the port as a number.
+struct BeaconAddress
+{
+    uint8_t ip[16] = {};
+    uint16_t port = 0;
+};
+
+struct BeaconId
+{
+    uint8_t bytes[BEACON_ID_SIZE] = {};
+};
+
+// One struct for every type; each type uses the fields its row in PROTOCOL.md
+// lists and leaves the others zero (decode zeroes them).
+struct BeaconMessage
+{
+    BeaconType type = BeaconType::BIND;
+    uint64_t nonce = 0;                            // every type
+    uint8_t cookie[BEACON_COOKIE_SIZE] = {};   // REGISTER, COOKIE, REGISTERED
+    uint8_t id_count = 0;                          // REGISTER: count (1-8); REGISTERED: accepted (0-8)
+    uint16_t ttl_seconds = 0;                      // REGISTERED
+    BeaconId ids[BEACON_MAX_IDS] = {};     // REGISTER: ids[0, count); MEET, INTRO, NOT_FOUND, PUNCH: ids[0]
+    BeaconAddress address = {};                // BOUND, INTRO
+};
+
+// The exact total size of a type, or 0 for a value that isn't a type.
+uint32_t beacon_message_size(uint8_t type);
+
+// True if `data` is exactly one valid message; fills `out` (all unused fields zero).
+bool beacon_decode(const uint8_t* data, size_t size, BeaconMessage* out);
+
+// Writes `message` into `out`. Returns the bytes written, or 0 if the message
+// breaks a field rule or `capacity` is too small (nothing useful is written then).
+uint32_t beacon_encode(const BeaconMessage* message, uint8_t* out, size_t capacity);
+
+// Small helpers for both sides.
+bool beacon_id_is_zero(const BeaconId* id);
+bool beacon_id_equal(const BeaconId* a, const BeaconId* b);
+bool beacon_address_equal(const BeaconAddress* a, const BeaconAddress* b);
+bool beacon_address_is_ipv4(const BeaconAddress* address);

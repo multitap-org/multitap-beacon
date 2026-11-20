@@ -1,0 +1,44 @@
+# systemd unit for the beacon server. Install:
+#   sudo install -m 755 build/beacon /usr/local/bin/beacon
+#   sudo install -m 644 packaging/beacon.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now beacon
+# Options go on ExecStart (beacon --help); `systemctl edit beacon` to change them.
+
+[Unit]
+Description=beacon: introductions for piccolo remote play (never relays traffic)
+Documentation=https://github.com/multitap-org/beacon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/beacon
+Restart=on-failure
+RestartSec=2
+
+# It needs nothing but two UDP ports above 1024: no user, no files, no privileges.
+DynamicUser=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
