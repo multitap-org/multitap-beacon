@@ -6,7 +6,7 @@
 
 [Unit]
 Description=beacon: introductions for piccolo remote play (never relays traffic)
-Documentation=https://github.com/multitap-org/beacon
+Documentation=https://github.com/multitap-org/multitap-beacon
 After=network-online.target
 Wants=network-online.target
 

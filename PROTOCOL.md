@@ -1,7 +1,7 @@
 # Beacon protocol v1
 
 Draft by the netcode session (2026-11-20), fixed and frozen by the beacon session the same
-day. The canonical copy is `PROTOCOL.md` in the beacon repo (multitap-org/beacon, local
+day. The canonical copy is `PROTOCOL.md` in the beacon repo (multitap-org/multitap-beacon, local
 `.repos/beacon`); this file is kept identical. The wire code is `wire/beacon_wire.h/.cpp`
 there: frontends-common should use that library (submodule), not re-implement the layout.
 
@@ -106,7 +106,7 @@ REGISTERED's accepted is 0-8; every address has a non-zero port and zero padding
 - The server sees which public addresses meet which, and when. It never sees keys, device
   names or game data. It logs counts only.
 
-## Server program (repo multitap-org/beacon, MIT)
+## Server program (repo multitap-org/multitap-beacon, MIT)
 
 - One small C++20 binary (STYLE.md: C-like, no auto / lambdas / templates / exceptions), only
   libc + sockets (Linux; other POSIX / Windows later if cheap) + Monocypher (submodule) for the
@@ -121,7 +121,7 @@ REGISTERED's accepted is 0-8; every address has a non-zero port and zero padding
 
 ## Changes from the first draft
 
-- Renamed (Andrés): the server is **beacon** (was "rendezvous"): repo multitap-org/beacon,
+- Renamed (Andrés): the server is **beacon** (was "rendezvous"): repo multitap-org/multitap-beacon,
   binary `beacon`, library `beacon_wire`. The magic is now "MTBC" (was "MTRV") and the meeting
   id's BLAKE2b prefix is "multitap beacon v1" (was "multitap rendezvous v1").
 - Exact sizes and offsets written down (BIND/BOUND 36, REGISTER 164, COOKIE 32, REGISTERED 36,

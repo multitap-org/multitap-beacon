@@ -52,8 +52,8 @@ on IPv4 and IPv6 if you have it. Then pick one of these.
 
 ```sh
 sudo apt install git cmake ninja-build g++          # Debian / Ubuntu
-git clone --recursive https://github.com/multitap-org/beacon.git
-cd beacon
+git clone --recursive https://github.com/multitap-org/multitap-beacon.git
+cd multitap-beacon
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/beacon
@@ -77,8 +77,8 @@ only IPv4 / IPv6 sockets.
 ### With Docker
 
 ```sh
-git clone --recursive https://github.com/multitap-org/beacon.git
-cd beacon
+git clone --recursive https://github.com/multitap-org/multitap-beacon.git
+cd multitap-beacon
 docker build -t beacon .
 docker run -d --name beacon --restart unless-stopped --network host beacon
 ```
