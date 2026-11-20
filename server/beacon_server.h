@@ -140,6 +140,10 @@ struct BeaconServer
     uint64_t epoch_started_ms = 0;
     BeaconBucket overflow = {};
     BeaconStats stats = {};
+    uint64_t intros_total = 0;      // since start, never reset (for the status file)
+    // beacon_server_count_hosts()'s work space: one address per possible entry,
+    // allocated once by beacon_server_create().
+    std::vector<BeaconAddress> host_scratch;
 };
 
 // Allocates the tables and the secrets. `now_ms` is the caller's monotonic clock.
@@ -157,5 +161,12 @@ void beacon_server_tick(BeaconServer* server, uint64_t now_ms);
 
 void beacon_server_stats_reset(BeaconServer* server);
 
-// Bytes the two tables take (for the startup log and the README's numbers).
+// Hosts reachable now: the distinct addresses that own a live entry. A host
+// that registers over both families counts once (its IPv6 entries whose id
+// also has an IPv4 entry are skipped); hosts behind one public IP count
+// separately (their ports differ). Sorts the addresses, so it's for every few
+// seconds (the status file), not per packet.
+uint32_t beacon_server_count_hosts(BeaconServer* server, uint64_t now_ms);
+
+// Bytes the tables take (the meeting and source tables, and the hosts work space) (for the startup log and the README's numbers).
 uint64_t beacon_server_table_bytes(const BeaconServer* server);

@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>beacon status</title>
+<meta name="description" content="How many piccolos this beacon can introduce right now.">
+<link rel="icon" href="piccolo-logo-dark.svg">
+<style>
+  /* piccolo's BLUE theme, dark page (assets/branding/README.md in piccolo). */
+  :root {
+    --background: #2A4068;
+    --text: #E0E6F0;
+    --shadow: #101828;
+    --accent: #FFC93C;
+    --dim: #8FA0BF;
+  }
+  html, body { margin: 0; background: var(--background); color: var(--text); }
+  body {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 40px;
+    padding: 32px 16px;
+    box-sizing: border-box;
+    font-family: system-ui, sans-serif;
+  }
+  .logo { width: 320px; max-width: 100%; height: auto; }
+  /* Text is drawn with piccolo's 5x5 pixel font as SVG rectangles (below). */
+  .pixel { display: block; max-width: 100%; height: auto; shape-rendering: crispEdges; }
+  .stack { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+  .text { fill: var(--text); }
+  .accent { fill: var(--accent); }
+  .dim { fill: var(--dim); }
+  .shadow { fill: var(--shadow); }
+  noscript { font-size: 14px; }
+</style>
+</head>
+<body>
+<img class="logo" src="piccolo-logo-dark.svg" alt="piccolo">
+<div class="stack">
+  <div id="count"></div>
+  <div id="label"></div>
+</div>
+<div id="intros"></div>
+<div id="updated"></div>
+<noscript>This page needs JavaScript to read status.json.</noscript>
+<script>
+"use strict";
+
+// piccolo's pixel font (src/pixel_font.cpp in piccolo), the characters this
+// page uses: '#' = pixel on. Every glyph is 5x5 and text advances 6 pixels.
+const GLYPHS = {
+  " ": [".....", ".....", ".....", ".....", "....."],
+  "0": [".###.", "#...#", "#.#.#", "#...#", ".###."],
+  "1": ["..#..", ".##..", "..#..", "..#..", "#####"],
+  "2": [".###.", "#...#", "...#.", "..#..", "#####"],
+  "3": ["####.", "....#", "..##.", "....#", "####."],
+  "4": ["#..#.", "#..#.", "#####", "...#.", "...#."],
+  "5": ["#####", "#....", "#####", "....#", "#####"],
+  "6": ["..##.", ".#...", "####.", "#...#", ".###."],
+  "7": ["#####", "....#", "...#.", "..#..", "..#.."],
+  "8": [".###.", "#...#", "#####", "#...#", ".###."],
+  "9": [".###.", "#...#", ".####", "...#.", ".##.."],
+  "A": ["..#..", ".#.#.", "#...#", "#####", "#...#"],
+  "B": ["####.", "#..#.", "####.", "#...#", "####."],
+  "C": [".####", "#....", "#....", "#....", ".####"],
+  "D": ["###..", "#..#.", "#...#", "#..#.", "###.."],
+  "E": ["#####", "#....", "###..", "#....", "#####"],
+  "F": ["#####", "#....", "###..", "#....", "#...."],
+  "G": [".###.", "#....", "#.###", "#...#", ".####"],
+  "H": ["#...#", "#...#", "#####", "#...#", "#...#"],
+  "I": [".###.", "..#..", "..#..", "..#..", ".###."],
+  "J": ["....#", "....#", "....#", "#...#", ".###."],
+  "K": ["#...#", "#..#.", "###..", "#..#.", "#...#"],
+  "L": ["#....", "#....", "#....", "#....", "#####"],
+  "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"],
+  "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#"],
+  "O": [".###.", "#...#", "#...#", "#...#", ".###."],
+  "P": ["####.", "#...#", "#...#", "####.", "#...."],
+  "Q": [".###.", "#...#", "#...#", ".###.", "...##"],
+  "R": ["####.", "#...#", "#...#", "####.", "#...#"],
+  "S": [".###.", "#....", ".###.", "....#", ".###."],
+  "T": ["#####", "..#..", "..#..", "..#..", "..#.."],
+  "U": ["#...#", "#...#", "#...#", "#...#", ".###."],
+  "V": ["#...#", "#...#", "#...#", ".#.#.", "..#.."],
+  "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"],
+  "X": ["#...#", ".#.#.", "..#..", ".#.#.", "#...#"],
+  "Y": ["#...#", ".#.#.", "..#..", "..#..", "..#.."],
+  "Z": ["#####", "...#.", "..#..", ".#...", "#####"],
+  ".": [".....", ".....", ".....", ".....", "..#.."],
+  ":": [".....", "..#..", ".....", "..#..", "....."],
+  "-": [".....", ".....", ".###.", ".....", "....."],
+  "?": ["####.", "....#", "..##.", ".....", "..#.."],
+};
+// Characters without a glyph draw as a hollow box, as in piccolo.
+const BOX = ["#####", "#...#", "#...#", "#...#", "#####"];
+const SVG = "http://www.w3.org/2000/svg";
+
+// Draws `text` into the element with id `id`: one SVG, one unit per font
+// pixel, `scale` CSS pixels per unit, with a hard shadow down-right (a quarter
+// of a font pixel on big text, one screen pixel on small text).
+function drawText(id, text, scale, colorClass) {
+  const upper = text.toUpperCase();
+  const shadow = Math.max(1, Math.round(scale / 4)) / scale;
+  const width = upper.length * 6;   // the last gap holds the shadow
+  const height = 5 + shadow;
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("class", "pixel");
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.setAttribute("width", String(width * scale));
+  svg.setAttribute("height", String(height * scale));
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", text);
+  const layers = [["shadow", shadow], [colorClass, 0]];
+  for (const [layerClass, offset] of layers) {
+    const group = document.createElementNS(SVG, "g");
+    group.setAttribute("class", layerClass);
+    for (let i = 0; i < upper.length; i++) {
+      const rows = GLYPHS[upper[i]] || BOX;
+      for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 5; x++) {
+          if (rows[y][x] !== "#") {
+            continue;
+          }
+          const pixel = document.createElementNS(SVG, "rect");
+          pixel.setAttribute("x", String(i * 6 + x + offset));
+          pixel.setAttribute("y", String(y + offset));
+          pixel.setAttribute("width", "1");
+          pixel.setAttribute("height", "1");
+          group.appendChild(pixel);
+        }
+      }
+    }
+    svg.appendChild(group);
+  }
+  document.getElementById(id).replaceChildren(svg);
+}
+
+// beacon writes status.json every 10 s; older than this, it's not running.
+const STALE_SECONDS = 60;
+const REFRESH_MS = 30000;
+let lastStatus = null;
+
+function show() {
+  const now = Date.now() / 1000;
+  const fresh = lastStatus !== null && now - lastStatus.updated < STALE_SECONDS;
+  if (!fresh) {
+    drawText("count", "?", 16, "accent");
+    drawText("label", "beacon is not answering", 4, "text");
+    drawText("intros", "", 3, "dim");
+    drawText("updated", lastStatus === null ? "no status yet" : "last update " + ago(now - lastStatus.updated), 3, "dim");
+    return;
+  }
+  const hosts = lastStatus.hosts_online;
+  drawText("count", String(hosts), 16, "accent");
+  drawText("label", hosts === 1 ? "piccolo online" : "piccolos online", 4, "text");
+  const intros = lastStatus.introductions_last_hour;
+  drawText("intros", intros + (intros === 1 ? " introduction" : " introductions") + " in the last hour", 3, "dim");
+  drawText("updated", "updated " + ago(now - lastStatus.updated), 3, "dim");
+}
+
+function ago(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 120) {
+    return s + " s ago";
+  }
+  if (s < 7200) {
+    return Math.round(s / 60) + " min ago";
+  }
+  return Math.round(s / 3600) + " h ago";
+}
+
+// Only numbers are taken from the file; anything else counts as no status.
+function valid(status) {
+  return status !== null && typeof status === "object" &&
+         Number.isInteger(status.hosts_online) && status.hosts_online >= 0 &&
+         Number.isInteger(status.introductions_last_hour) && status.introductions_last_hour >= 0 &&
+         Number.isInteger(status.updated) && status.updated > 0;
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("status.json", { cache: "no-store" });
+    if (response.ok) {
+      const status = await response.json();
+      if (valid(status)) {
+        lastStatus = status;
+      }
+    }
+  } catch (error) {
+    // Keep the last status: it turns stale on its own.
+  }
+  show();
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+setInterval(show, 1000);
+</script>
+</body>
+</html>

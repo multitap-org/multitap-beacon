@@ -6,6 +6,7 @@
 #include "beacon_log.h"
 #include "beacon_net.h"
 #include "beacon_server.h"
+#include "beacon_status.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -30,6 +31,7 @@ struct Options
     uint16_t primary_port = DEFAULT_PRIMARY_PORT;
     uint16_t secondary_port = DEFAULT_SECONDARY_PORT;  // 0 = no secondary socket
     uint32_t stats_interval_seconds = 60;              // 0 = no stats lines
+    const char* status_file = nullptr;                 // --status-file, nullptr = none
     BeaconServerConfig config = {};
     BeaconLogLevel log_level = BeaconLogLevel::info;
 };
@@ -57,6 +59,8 @@ static void print_usage(FILE* out)
             "                            with port forwarding: senders from private addresses are reported\n"
             "                            with it (give it twice for both families; default: off)\n"
             "  --stats-interval SECONDS  log counts this often, 0 = never (default 60)\n"
+            "  --status-file PATH        write hosts online and introductions in the last hour to this JSON\n"
+            "                            file every 10 s, for the status page (default: off)\n"
             "  --log-level LEVEL         error, warning, info or debug (default info)\n"
             "  --version                 print the version\n"
             "  --help                    this text\n",
@@ -227,6 +231,15 @@ static int parse_options(int argc, char** argv, Options* options)
                 return 1;
             }
         }
+        else if (strcmp(name, "--status-file") == 0)
+        {
+            if (value[0] == '\0')
+            {
+                fprintf(stderr, "beacon: --status-file needs a path\n");
+                return 1;
+            }
+            options->status_file = value;
+        }
         else if (strcmp(name, "--log-level") == 0)
         {
             if (!beacon_log_parse_level(value, &options->log_level))
@@ -284,10 +297,23 @@ static int open_signal_fd()
     return fd;
 }
 
-static void run(BeaconServer* server, BeaconNet* net, int signal_fd, uint32_t stats_interval_seconds)
+static void write_status(BeaconStatus* status, BeaconServer* server, uint64_t now_ms)
+{
+    beacon_status_update(status, beacon_server_count_hosts(server, now_ms), server->intros_total,
+                         beacon_unix_seconds());
+}
+
+// `status` is nullptr without --status-file.
+static void run(BeaconServer* server, BeaconNet* net, int signal_fd, uint32_t stats_interval_seconds,
+                BeaconStatus* status)
 {
     uint64_t now = beacon_now_ms();
     uint64_t next_tick = now + TICK_MS;
+    uint64_t next_status = now + BEACON_STATUS_INTERVAL_MS;
+    if (status != nullptr)
+    {
+        write_status(status, server, now);
+    }
     uint64_t stats_ms = static_cast<uint64_t>(stats_interval_seconds) * 1000u;
     uint64_t next_stats = now + stats_ms;
     bool running = true;
@@ -335,6 +361,11 @@ static void run(BeaconServer* server, BeaconNet* net, int signal_fd, uint32_t st
         {
             beacon_server_tick(server, now);
             next_tick = now + TICK_MS;
+        }
+        if (status != nullptr && now >= next_status)
+        {
+            write_status(status, server, now);
+            next_status = now + BEACON_STATUS_INTERVAL_MS;
         }
         if (stats_ms != 0 && now >= next_stats)
         {
@@ -390,7 +421,16 @@ int main(int argc, char** argv)
         beacon_log(BeaconLogLevel::info, "secondary port: UDP %u", static_cast<unsigned>(net.secondary_port));
     }
 
-    run(&server, &net, signal_fd, options.stats_interval_seconds);
+    BeaconStatus status;
+    BeaconStatus* status_used = nullptr;
+    if (options.status_file != nullptr && beacon_status_open(&status, options.status_file))
+    {
+        beacon_log(BeaconLogLevel::info, "status file: %s, every %" PRIu64 " s", options.status_file,
+                   BEACON_STATUS_INTERVAL_MS / 1000);
+        status_used = &status;
+    }
+
+    run(&server, &net, signal_fd, options.stats_interval_seconds, status_used);
 
     if (options.stats_interval_seconds != 0)
     {

@@ -21,6 +21,9 @@ RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBEACON_TESTS=OFF 
 
 FROM debian:trixie-slim
 COPY --from=build /build/beacon /usr/local/bin/beacon
+# For --status-file /status/status.json: a named volume mounted here starts
+# with this directory's owner, so nobody can write to it.
+RUN mkdir /status && chown nobody:nogroup /status
 USER nobody
 EXPOSE 55430/udp 55431/udp
 ENTRYPOINT ["/usr/local/bin/beacon"]

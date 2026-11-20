@@ -3,6 +3,11 @@
 #   sudo install -m 644 packaging/beacon.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now beacon
 # Options go on ExecStart (beacon --help); `systemctl edit beacon` to change them.
+# For the status page (README.md, "Status page"), add in that override:
+#   ExecStart=
+#   ExecStart=/usr/local/bin/beacon --status-file /run/beacon/status.json
+#   RuntimeDirectory=beacon
+#   RuntimeDirectoryMode=0755
 
 [Unit]
 Description=beacon: introductions for piccolo remote play (never relays traffic)
@@ -15,7 +20,8 @@ ExecStart=/usr/local/bin/beacon
 Restart=on-failure
 RestartSec=2
 
-# It needs nothing but two UDP ports above 1024: no user, no files, no privileges.
+# It needs nothing but two UDP ports above 1024: no user, no files (but the
+# optional status file), no privileges.
 DynamicUser=yes
 CapabilityBoundingSet=
 NoNewPrivileges=yes

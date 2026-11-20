@@ -45,7 +45,7 @@ to amplify attacks).
 ## Self-hosting in a few minutes
 
 Any Linux machine with a public IP works (a small VPS is plenty: the default
-tables take 13 MiB of memory). Open **UDP 55430 and 55431** in your firewall,
+tables take 14 MiB of memory). Open **UDP 55430 and 55431** in your firewall,
 on IPv4 and IPv6 if you have it. Then pick one of these.
 
 ### Build and run directly
@@ -119,6 +119,77 @@ The router's public IP must be a real one: behind carrier-grade NAT (a WAN
 address in 100.64/10 or another private range) nothing outside can reach the
 server; use a VPS then.
 
+### Status page
+
+`packaging/status/` is a public page that shows how many piccolos the beacon
+can introduce right now, and how many introductions it made in the last hour.
+beacon itself serves no HTTP: with `--status-file PATH` it writes counts
+(never ids or addresses) every 10 seconds, replacing the file atomically:
+
+```json
+{"hosts_online": 12, "introductions_last_hour": 40, "updated": 1795000000}
+```
+
+`hosts_online` counts the distinct host addresses with a live registration: a
+host registered over IPv4 and IPv6 counts once, two piccolos behind one public
+IP count twice. The page reads `status.json` next to itself every 30 seconds
+and says the beacon isn't answering when the file is older than a minute. Any
+web server that serves `index.html`, `piccolo-logo-dark.svg` and the status
+file from one directory works.
+
+**systemd + Caddy.** `systemctl edit beacon`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/beacon --status-file /run/beacon/status.json
+RuntimeDirectory=beacon
+RuntimeDirectoryMode=0755
+```
+
+and in the Caddyfile (the page copied to `/srv/beacon-status`):
+
+```
+beacon.example.org {
+    handle /status.json {
+        root * /run/beacon
+        header Cache-Control no-store
+        file_server
+    }
+    handle {
+        root * /srv/beacon-status
+        file_server
+    }
+}
+```
+
+**Docker (Nginx Proxy Manager or any proxy).** beacon writes into a volume,
+a small nginx container serves it with the page, and the proxy points a host
+name at that container:
+
+```yaml
+services:
+  beacon:
+    build: ./multitap-beacon
+    network_mode: host
+    restart: unless-stopped
+    command: ["--status-file", "/status/status.json"]
+    volumes:
+      - beacon-status:/status
+  beacon-page:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - beacon-status:/usr/share/nginx/html:ro
+      - ./multitap-beacon/packaging/status/index.html:/usr/share/nginx/html/index.html:ro
+      - ./multitap-beacon/packaging/status/piccolo-logo-dark.svg:/usr/share/nginx/html/piccolo-logo-dark.svg:ro
+volumes:
+  beacon-status:
+```
+
+In Nginx Proxy Manager, add a proxy host for the status name with forward
+host `beacon-page`, port 80 (the containers must share a network with NPM).
+
 ## Ports and firewall
 
 | port | protocol | what |
@@ -146,6 +217,8 @@ symmetric NAT early.
 --public-address IP       the server's public IPv4 or IPv6 address, for a server behind a NAT
                           with port forwarding (give it twice for both families; default: off)
 --stats-interval SECONDS  log counts this often, 0 = never (default 60)
+--status-file PATH        write hosts online and introductions in the last hour to this JSON
+                          file every 10 s, for the status page (default: off)
 --log-level LEVEL         error, warning, info or debug (default info)
 ```
 
@@ -160,8 +233,8 @@ All memory is allocated at startup; nothing is allocated per packet.
 
 | tables | memory |
 |---|---|
-| default (65536 ids, 65536 sources) | 13 MiB (RSS about 17 MiB) |
-| 1M ids, 1M sources | 208 MiB |
+| default (65536 ids, 65536 sources) | 14 MiB (RSS about 18 MiB) |
+| 1M ids, 1M sources | 225 MiB |
 
 Measured on an RK3588 (one Cortex-A76 core, Release build): the logic alone
 handles about 370,000 BIND, 255,000 MEET or 75,000 REGISTER (8 ids) packets
@@ -206,4 +279,5 @@ BSD-2-Clause or CC0) for keyed BLAKE2b (cookies and table hashing).
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE).
+MIT, see [`LICENSE`](LICENSE). `packaging/status/piccolo-logo-dark.svg` is piccolo's
+logo, the Multitap project's own branding.

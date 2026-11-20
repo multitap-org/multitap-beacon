@@ -78,7 +78,8 @@ add_library(beacon_core STATIC
     server/beacon_log.cpp
     server/beacon_random.cpp
     server/beacon_server.cpp
-    server/beacon_net.cpp)
+    server/beacon_net.cpp
+    server/beacon_status.cpp)
 target_include_directories(beacon_core PUBLIC server)
 target_link_libraries(beacon_core PUBLIC beacon_wire PRIVATE beacon_dep_monocypher)
 beacon_set_flags(beacon_core)

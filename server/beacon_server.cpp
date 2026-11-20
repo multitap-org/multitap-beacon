@@ -7,6 +7,7 @@
 
 #include <monocypher.h>
 
+#include <cstdlib>
 #include <cstring>
 
 static constexpr uint32_t NO_SLOT = 0xffffffffu;
@@ -465,6 +466,7 @@ static void handle_meet(BeaconServer* server, uint64_t now_ms, const BeaconAddre
     }
     entry->last_intro_ms = now_ms;
     server->stats.intros++;
+    server->intros_total++;
 
     reply.type = BeaconType::INTRO;
     reply.address = entry->address;
@@ -555,6 +557,7 @@ bool beacon_server_create(BeaconServer* server, const BeaconServerConfig* config
     uint32_t source_slots = table_slots_for(config->max_sources);
     server->entries.resize(entry_slots);
     server->sources.resize(source_slots);
+    server->host_scratch.resize(config->max_entries);
     server->entry_mask = entry_slots - 1;
     server->source_mask = source_slots - 1;
     if (!beacon_random_fill(server->hash_key, sizeof(server->hash_key)) ||
@@ -627,8 +630,74 @@ void beacon_server_stats_reset(BeaconServer* server)
     server->stats.sources = sources;
 }
 
+// Whether (id, family) has a live entry. Unlike entry_scan() it frees nothing,
+// so it can run while the table is being walked.
+static bool entry_live(const BeaconServer* server, uint64_t now_ms, const BeaconId* id, uint8_t ipv4)
+{
+    uint32_t home = entry_home(server, id, ipv4);
+    for (uint32_t i = 0; i < BEACON_PROBE_WINDOW; i++)
+    {
+        const BeaconEntry* entry = &server->entries[(home + i) & server->entry_mask];
+        if (entry->used != 0 && entry->expires_ms > now_ms && entry->ipv4 == ipv4 &&
+            beacon_id_equal(&entry->id, id))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int address_compare(const void* a, const void* b)
+{
+    const BeaconAddress* left = static_cast<const BeaconAddress*>(a);
+    const BeaconAddress* right = static_cast<const BeaconAddress*>(b);
+    int by_ip = memcmp(left->ip, right->ip, sizeof(left->ip));
+    if (by_ip != 0)
+    {
+        return by_ip;
+    }
+    if (left->port != right->port)
+    {
+        return left->port < right->port ? -1 : 1;
+    }
+    return 0;
+}
+
+uint32_t beacon_server_count_hosts(BeaconServer* server, uint64_t now_ms)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < server->entries.size() && count < server->host_scratch.size(); i++)
+    {
+        const BeaconEntry* entry = &server->entries[i];
+        if (entry->used == 0 || entry->expires_ms <= now_ms)
+        {
+            continue;
+        }
+        if (entry->ipv4 == 0 && entry_live(server, now_ms, &entry->id, 1))
+        {
+            continue;
+        }
+        server->host_scratch[count++] = entry->reply_to;
+    }
+    if (count == 0)
+    {
+        return 0;
+    }
+    qsort(server->host_scratch.data(), count, sizeof(BeaconAddress), address_compare);
+    uint32_t hosts = 1;
+    for (size_t i = 1; i < count; i++)
+    {
+        if (address_compare(&server->host_scratch[i - 1], &server->host_scratch[i]) != 0)
+        {
+            hosts++;
+        }
+    }
+    return hosts;
+}
+
 uint64_t beacon_server_table_bytes(const BeaconServer* server)
 {
     return static_cast<uint64_t>(server->entries.size()) * sizeof(BeaconEntry) +
-           static_cast<uint64_t>(server->sources.size()) * sizeof(BeaconSource);
+           static_cast<uint64_t>(server->sources.size()) * sizeof(BeaconSource) +
+           static_cast<uint64_t>(server->host_scratch.size()) * sizeof(BeaconAddress);
 }

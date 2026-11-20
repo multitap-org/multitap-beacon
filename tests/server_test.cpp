@@ -2,6 +2,7 @@
 // introductions, expiry, limits, rate limits, address families.
 
 #include "beacon_server.h"
+#include "beacon_status.h"
 
 #include <cstdio>
 #include <cstring>
@@ -520,6 +521,92 @@ static void test_public_address()
     beacon_server_destroy(&f.server);
 }
 
+static void test_count_hosts()
+{
+    Fixture f;
+    BeaconServerConfig config = {};
+    check(fixture_create(&f, &config), "server creates");
+    check(beacon_server_count_hosts(&f.server, f.now) == 0, "no hosts at first");
+
+    // Host A over IPv4 with three ids, and over IPv6 with the same ids: one host.
+    BeaconAddress a4 = ipv4(198, 51, 100, 1, 40000);
+    BeaconAddress a6 = ipv6(1, 1, 40000);
+    check(register_ids(&f, &a4, 100, 3, nullptr) == 3, "A registers over IPv4");
+    check(register_ids(&f, &a6, 100, 3, nullptr) == 3, "A registers over IPv6");
+    check(beacon_server_count_hosts(&f.server, f.now) == 1, "a dual-stack host counts once");
+
+    // Host B behind the same public IPv4 (another port), host C on IPv6 only.
+    BeaconAddress b4 = ipv4(198, 51, 100, 1, 40001);
+    BeaconAddress c6 = ipv6(9, 2, 50000);
+    check(register_ids(&f, &b4, 200, 1, nullptr) == 1, "B registers");
+    check(register_ids(&f, &c6, 300, 2, nullptr) == 2, "C registers");
+    check(beacon_server_count_hosts(&f.server, f.now) == 3, "hosts behind one IP count separately");
+
+    // A MEET counts in intros_total, which stats_reset leaves alone.
+    BeaconMessage m = make_meet(5, 200);
+    BeaconAddress client = ipv4(203, 0, 113, 50, 1234);
+    send_message(&f, BeaconSocket::PRIMARY, &client, &m);
+    beacon_server_stats_reset(&f.server);
+    check(f.server.intros_total == 1, "intros_total counts INTROs and survives stats_reset");
+
+    // Expired entries aren't counted even before the sweep frees them.
+    f.now += static_cast<uint64_t>(BEACON_ENTRY_TTL_SECONDS) * 1000u;
+    check(beacon_server_count_hosts(&f.server, f.now) == 0, "expired hosts aren't counted");
+    beacon_server_destroy(&f.server);
+}
+
+static void test_status_file()
+{
+    char text[160];
+    size_t size = beacon_status_format(text, sizeof(text), 12, 40, 1795000000);
+    const char* expected = "{\"hosts_online\": 12, \"introductions_last_hour\": 40, \"updated\": 1795000000}\n";
+    check(size == strlen(expected) && strcmp(text, expected) == 0, "status JSON format");
+    check(beacon_status_format(text, 10, 12, 40, 1795000000) == 0, "status JSON that doesn't fit is refused");
+
+    // Written next to the test binary (ctest runs in the build directory).
+    BeaconStatus status;
+    check(beacon_status_open(&status, "status_test.json"), "status opens");
+    // Before the ring is full: since the first sample.
+    check(beacon_status_update(&status, 3, 100, 1), "status writes");
+    check(beacon_status_update(&status, 3, 105, 2), "status writes again");
+    FILE* file = fopen("status_test.json", "rb");
+    size_t got = 0;
+    if (file != nullptr)
+    {
+        got = fread(text, 1, sizeof(text) - 1, file);
+        fclose(file);
+    }
+    text[got] = '\0';
+    check(strstr(text, "\"introductions_last_hour\": 5,") != nullptr, "introductions since the first sample");
+    check(strstr(text, "\"hosts_online\": 3,") != nullptr, "hosts_online is written");
+    FILE* temp = fopen("status_test.json.tmp", "rb");
+    check(temp == nullptr, "no temporary file left behind");
+    if (temp != nullptr)
+    {
+        fclose(temp);
+    }
+    // A full ring: the last hour is the last 360 updates.
+    for (uint64_t i = 0; i < 1000; i++)
+    {
+        beacon_status_update(&status, 0, 1000 + i * 2, 3 + i);
+    }
+    file = fopen("status_test.json", "rb");
+    got = 0;
+    if (file != nullptr)
+    {
+        got = fread(text, 1, sizeof(text) - 1, file);
+        fclose(file);
+    }
+    text[got] = '\0';
+    check(strstr(text, "\"introductions_last_hour\": 720,") != nullptr, "introductions over the last hour");
+    remove("status_test.json");
+
+    BeaconStatus bad;
+    check(beacon_status_open(&bad, "/nonexistent-dir/status.json"), "status opens a bad path");
+    check(!beacon_status_update(&bad, 1, 1, 1), "a write that fails returns false");
+    check(bad.failing, "a failing write is remembered (logged once)");
+}
+
 static void test_bad_config()
 {
     BeaconServer server;
@@ -540,6 +627,8 @@ int main()
     test_rate_limit();
     test_families_and_rebinding();
     test_public_address();
+    test_count_hosts();
+    test_status_file();
     test_bad_config();
     if (g_failures != 0)
     {
