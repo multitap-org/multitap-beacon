@@ -86,7 +86,8 @@ static void print_usage(FILE* out)
             "                            with it (give it twice for both families; default: off)\n"
             "  --stats-interval SECONDS  log counts this often, 0 = never (default 60)\n"
             "  --status-file PATH        write hosts online and introductions in the last hour to this JSON\n"
-            "                            file every 10 s, for the status page (default: off)\n"
+            "                            file every 10 s, and their history (7 days, 30 days, a year) to\n"
+            "                            history.json next to it, for the status page (default: off)\n"
             "  --log-level LEVEL         error, warning, info or debug (default info)\n"
             "  --version                 print the version\n"
             "  --help                    this text\n",
@@ -605,7 +606,7 @@ int main(int argc, char** argv)
     }
 
     BeaconStatus status;
-    if (options.status_file != nullptr && beacon_status_open(&status, options.status_file))
+    if (options.status_file != nullptr && beacon_status_open(&status, options.status_file, beacon_unix_seconds()))
     {
         beacon_log(BeaconLogLevel::info, "status file: %s, every %" PRIu64 " s", options.status_file,
                    BEACON_STATUS_INTERVAL_MS / 1000);
@@ -623,6 +624,11 @@ int main(int argc, char** argv)
                 log_signal_stats(loop.signal, options.stats_interval_seconds);
             }
         }
+    }
+    if (loop.status != nullptr)
+    {
+        // The bucket in progress, so a restart doesn't leave a hole.
+        beacon_status_flush(loop.status, beacon_unix_seconds());
     }
     if (loop.signal != nullptr)
     {

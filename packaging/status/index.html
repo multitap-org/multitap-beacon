@@ -14,6 +14,7 @@
     --shadow: #101828;
     --accent: #FFC93C;
     --dim: #8FA0BF;
+    --grid: #3A5482;
   }
   html, body { margin: 0; background: var(--background); color: var(--text); }
   body {
@@ -36,6 +37,21 @@
   .dim { fill: var(--dim); }
   .shadow { fill: var(--shadow); }
   noscript { font-size: 14px; }
+  /* History charts: one per resolution, stacked. */
+  .charts { display: flex; flex-direction: column; gap: 32px; width: 100%; max-width: 760px; }
+  .chart { display: flex; flex-direction: column; gap: 10px; position: relative; }
+  .chart-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .chart svg.plot { display: block; width: 100%; height: auto; touch-action: pan-y; }
+  .grid { stroke: var(--grid); stroke-width: 1; shape-rendering: crispEdges; }
+  .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .area { fill: var(--accent); fill-opacity: 0.12; stroke: none; }
+  .cross { stroke: var(--dim); stroke-width: 1; shape-rendering: crispEdges; }
+  .marker { fill: var(--accent); stroke: var(--background); stroke-width: 2; }
+  .tooltip {
+    position: absolute; pointer-events: none; display: none;
+    background: var(--shadow); padding: 8px 10px; border-radius: 4px;
+    flex-direction: column; gap: 6px;
+  }
 </style>
 </head>
 <body>
@@ -46,7 +62,8 @@
 </div>
 <div id="intros"></div>
 <div id="updated"></div>
-<noscript>This page needs JavaScript to read status.json.</noscript>
+<div class="charts" id="charts"></div>
+<noscript>This page needs JavaScript to read status.json and history.json.</noscript>
 <script>
 "use strict";
 
@@ -99,10 +116,10 @@ const GLYPHS = {
 const BOX = ["#####", "#...#", "#...#", "#...#", "#####"];
 const SVG = "http://www.w3.org/2000/svg";
 
-// Draws `text` into the element with id `id`: one SVG, one unit per font
-// pixel, `scale` CSS pixels per unit, with a hard shadow down-right (a quarter
-// of a font pixel on big text, one screen pixel on small text).
-function drawText(id, text, scale, colorClass) {
+// `text` as one SVG: one unit per font pixel, `scale` CSS pixels per unit,
+// with a hard shadow down-right (a quarter of a font pixel on big text, one
+// screen pixel on small text).
+function textSvg(text, scale, colorClass) {
   const upper = text.toUpperCase();
   const shadow = Math.max(1, Math.round(scale / 4)) / scale;
   const width = upper.length * 6;   // the last gap holds the shadow
@@ -136,8 +153,397 @@ function drawText(id, text, scale, colorClass) {
     }
     svg.appendChild(group);
   }
-  document.getElementById(id).replaceChildren(svg);
+  return svg;
 }
+
+// Draws `text` into the element with id `id`.
+function drawText(id, text, scale, colorClass) {
+  document.getElementById(id).replaceChildren(textSvg(text, scale, colorClass));
+}
+
+// The same font as a <g> of rectangles inside another SVG, top-left at (x, y),
+// `scale` user units per font pixel. `align` is "start", "middle" or "end".
+function pixelGroup(text, x, y, scale, colorClass, align) {
+  const upper = text.toUpperCase();
+  const width = (upper.length * 6 - 1) * scale;
+  let left = x;
+  if (align === "middle") {
+    left = x - width / 2;
+  } else if (align === "end") {
+    left = x - width;
+  }
+  left = Math.round(left);
+  const group = document.createElementNS(SVG, "g");
+  group.setAttribute("class", colorClass);
+  group.setAttribute("shape-rendering", "crispEdges");
+  for (let i = 0; i < upper.length; i++) {
+    const rows = GLYPHS[upper[i]] || BOX;
+    for (let row = 0; row < 5; row++) {
+      for (let col = 0; col < 5; col++) {
+        if (rows[row][col] !== "#") {
+          continue;
+        }
+        const pixel = document.createElementNS(SVG, "rect");
+        pixel.setAttribute("x", String(left + (i * 6 + col) * scale));
+        pixel.setAttribute("y", String(Math.round(y) + row * scale));
+        pixel.setAttribute("width", String(scale));
+        pixel.setAttribute("height", String(scale));
+        group.appendChild(pixel);
+      }
+    }
+  }
+  return group;
+}
+
+// --- History charts (history.json) -----------------------------------------
+// Three resolutions written by beacon: points are [bucket start, most clients
+// online in the bucket, pairings in the bucket]. Missing buckets (beacon was
+// down) are gaps, not zeros.
+
+const TIERS = [
+  { key: "week", title: "last 7 days" },
+  { key: "month", title: "last 30 days" },
+  { key: "year", title: "last 12 months" },
+];
+const HISTORY_REFRESH_MS = 300000;
+const DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+let lastHistory = null;
+
+function pad2(n) {
+  return n < 10 ? "0" + n : String(n);
+}
+
+// Tooltip time for a bucket, in the viewer's time zone.
+function bucketLabel(key, start) {
+  const d = new Date(start * 1000);
+  const day = d.getDate() + " " + MONTHS[d.getMonth()];
+  if (key === "year") {
+    return day + " " + d.getFullYear();
+  }
+  const time = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  if (key === "week") {
+    return DAYS[d.getDay()] + " " + day + " " + time;
+  }
+  return day + " " + time;
+}
+
+// Axis ticks: local midnights (week: every day, month: every 7 days) or the
+// first of every month (year), as [unix seconds, label].
+function ticks(key, from, to) {
+  const out = [];
+  const d = new Date(from * 1000);
+  d.setHours(0, 0, 0, 0);
+  if (key === "year") {
+    d.setDate(1);
+  }
+  while (d.getTime() / 1000 <= to) {
+    const t = d.getTime() / 1000;
+    if (t >= from) {
+      if (key === "week") {
+        out.push([t, DAYS[d.getDay()]]);
+      } else if (key === "month") {
+        out.push([t, d.getDate() + " " + MONTHS[d.getMonth()]]);
+      } else {
+        out.push([t, MONTHS[d.getMonth()]]);
+      }
+    }
+    if (key === "week") {
+      d.setDate(d.getDate() + 1);
+    } else if (key === "month") {
+      d.setDate(d.getDate() + 7);
+    } else {
+      d.setMonth(d.getMonth() + 1);
+    }
+  }
+  return out;
+}
+
+// A round top for the y axis with 4 steps: 0, 1, 2, 5 x 10^n.
+function niceMax(peak) {
+  if (peak <= 4) {
+    return 4;
+  }
+  const raw = peak / 4;
+  const power = Math.pow(10, Math.floor(Math.log10(raw)));
+  let step = power;
+  for (const f of [1, 2, 5, 10]) {
+    if (f * power >= raw) {
+      step = f * power;
+      break;
+    }
+  }
+  return step * 4;
+}
+
+// Only well-formed points are used: integers, on a bucket boundary, in order.
+function tierPoints(tier) {
+  if (tier === null || typeof tier !== "object" || !Number.isInteger(tier.bucket_seconds) ||
+      tier.bucket_seconds <= 0 || !Array.isArray(tier.points)) {
+    return null;
+  }
+  const points = [];
+  let previous = -1;
+  for (const p of tier.points) {
+    if (!Array.isArray(p) || p.length !== 3 || !p.every(Number.isInteger) || p[0] <= previous ||
+        p[0] % tier.bucket_seconds !== 0 || p[1] < 0 || p[2] < 0) {
+      continue;
+    }
+    points.push(p);
+    previous = p[0];
+  }
+  return { bucket: tier.bucket_seconds, points: points };
+}
+
+function drawChart(section, info, data, now) {
+  const head = section.querySelector(".chart-head");
+  const plotBox = section.querySelector(".plot-box");
+  const tooltip = section.querySelector(".tooltip");
+  const bucket = data.bucket;
+  // The span the tier covers, ending with the bucket in progress.
+  const count = info.key === "week" ? 672 : info.key === "month" ? 720 : 366;
+  const last = now - (now % bucket);
+  const first = last - (count - 1) * bucket;
+  const byStart = new Map();
+  for (const p of data.points) {
+    if (p[0] >= first && p[0] <= last) {
+      byStart.set(p[0], p);
+    }
+  }
+  let peak = 0;
+  let pairings = 0;
+  for (const p of byStart.values()) {
+    peak = Math.max(peak, p[1]);
+    pairings += p[2];
+  }
+
+  // Head: title left, peak and pairings right.
+  head.replaceChildren();
+  const titleBox = document.createElement("div");
+  const sumBox = document.createElement("div");
+  head.append(titleBox, sumBox);
+  titleBox.appendChild(textSvg(info.title, 3, "text"));
+  sumBox.appendChild(textSvg("peak " + peak + "   " + pairings + (pairings === 1 ? " pairing" : " pairings"), 2, "dim"));
+
+  const width = Math.max(300, Math.min(760, Math.round(plotBox.clientWidth || 760)));
+  const height = width < 480 ? 150 : 190;
+  const left = 44;
+  const right = 8;
+  const top = 8;
+  const bottom = 22;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const yMax = niceMax(peak);
+  const x = function (t) { return left + ((t - first) / (last - first)) * plotW; };
+  const y = function (v) { return top + plotH - (v / yMax) * plotH; };
+
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("class", "plot");
+  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", info.title + ": clients online, peak " + peak + ", " + pairings + " pairings");
+
+  // Gridlines and y labels (0 and the top two steps keep it quiet).
+  for (let i = 0; i <= 4; i++) {
+    const v = (yMax / 4) * i;
+    const gy = Math.round(y(v)) + 0.5;
+    const line = document.createElementNS(SVG, "line");
+    line.setAttribute("class", "grid");
+    line.setAttribute("x1", String(left));
+    line.setAttribute("x2", String(width - right));
+    line.setAttribute("y1", String(gy));
+    line.setAttribute("y2", String(gy));
+    svg.appendChild(line);
+    if (i % 2 === 0) {
+      svg.appendChild(pixelGroup(String(v), left - 8, gy - 5, 2, "dim", "end"));
+    }
+  }
+  // X ticks.
+  const tickList = ticks(info.key, first, last);
+  let lastLabelRight = -Infinity;
+  for (const [t, label] of tickList) {
+    const tx = Math.round(x(t)) + 0.5;
+    const line = document.createElementNS(SVG, "line");
+    line.setAttribute("class", "grid");
+    line.setAttribute("x1", String(tx));
+    line.setAttribute("x2", String(tx));
+    line.setAttribute("y1", String(top + plotH));
+    line.setAttribute("y2", String(top + plotH + 4));
+    svg.appendChild(line);
+    // Skip labels that would touch the previous one (narrow screens).
+    const labelWidth = (label.length * 6 - 1) * 2;
+    if (tx - labelWidth / 2 > lastLabelRight + 8 && tx + labelWidth / 2 <= width) {
+      svg.appendChild(pixelGroup(label, tx, top + plotH + 9, 2, "dim", "middle"));
+      lastLabelRight = tx + labelWidth / 2;
+    }
+  }
+
+  // The series: runs of consecutive buckets, each its own area and line.
+  const runs = [];
+  let run = [];
+  for (let t = first; t <= last; t += bucket) {
+    const p = byStart.get(t);
+    if (p === undefined) {
+      if (run.length > 0) {
+        runs.push(run);
+      }
+      run = [];
+    } else {
+      run.push(p);
+    }
+  }
+  if (run.length > 0) {
+    runs.push(run);
+  }
+  const baseY = y(0);
+  for (const r of runs) {
+    let line = "";
+    for (let i = 0; i < r.length; i++) {
+      line += (i === 0 ? "M" : "L") + x(r[i][0]).toFixed(1) + " " + y(r[i][1]).toFixed(1);
+    }
+    if (r.length === 1) {
+      // A lone bucket is a short flat step, so it's visible.
+      line += "L" + (x(r[0][0]) + Math.max(2, plotW / count)).toFixed(1) + " " + y(r[0][1]).toFixed(1);
+    }
+    const startX = x(r[0][0]).toFixed(1);
+    const endX = (r.length === 1 ? x(r[0][0]) + Math.max(2, plotW / count) : x(r[r.length - 1][0])).toFixed(1);
+    const area = document.createElementNS(SVG, "path");
+    area.setAttribute("class", "area");
+    area.setAttribute("d", line + "L" + endX + " " + baseY.toFixed(1) + "L" + startX + " " + baseY.toFixed(1) + "Z");
+    svg.appendChild(area);
+    const path = document.createElementNS(SVG, "path");
+    path.setAttribute("class", "line");
+    path.setAttribute("d", line);
+    svg.appendChild(path);
+  }
+
+  // Hover: a crosshair that snaps to the nearest bucket, a marker on the
+  // line, and the values in a tooltip.
+  const cross = document.createElementNS(SVG, "line");
+  cross.setAttribute("class", "cross");
+  cross.setAttribute("y1", String(top));
+  cross.setAttribute("y2", String(top + plotH));
+  cross.style.display = "none";
+  svg.appendChild(cross);
+  const marker = document.createElementNS(SVG, "circle");
+  marker.setAttribute("class", "marker");
+  marker.setAttribute("r", "5");
+  marker.style.display = "none";
+  svg.appendChild(marker);
+  const hit = document.createElementNS(SVG, "rect");
+  hit.setAttribute("x", String(left));
+  hit.setAttribute("y", "0");
+  hit.setAttribute("width", String(plotW));
+  hit.setAttribute("height", String(height));
+  hit.setAttribute("fill", "transparent");
+  svg.appendChild(hit);
+
+  function hide() {
+    cross.style.display = "none";
+    marker.style.display = "none";
+    tooltip.style.display = "none";
+  }
+  function move(event) {
+    const box = svg.getBoundingClientRect();
+    const userX = ((event.clientX - box.left) / box.width) * width;
+    let index = Math.round(((userX - left) / plotW) * (count - 1));
+    index = Math.max(0, Math.min(count - 1, index));
+    const t = first + index * bucket;
+    const p = byStart.get(t);
+    const cx = Math.round(x(t)) + 0.5;
+    cross.setAttribute("x1", String(cx));
+    cross.setAttribute("x2", String(cx));
+    cross.style.display = "";
+    const lines = [bucketLabel(info.key, t)];
+    if (p === undefined) {
+      marker.style.display = "none";
+      lines.push(t > now ? "" : "no data");
+    } else {
+      marker.setAttribute("cx", String(x(t)));
+      marker.setAttribute("cy", String(y(p[1])));
+      marker.style.display = "";
+      lines.push(p[1] + (p[1] === 1 ? " client" : " clients"));
+      lines.push(p[2] + (p[2] === 1 ? " pairing" : " pairings"));
+    }
+    tooltip.replaceChildren();
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i] !== "") {
+        tooltip.appendChild(textSvg(lines[i], 2, i === 0 ? "dim" : "text"));
+      }
+    }
+    tooltip.style.display = "flex";
+    // Beside the crosshair, flipped to the left near the right edge.
+    const scale = box.width / width;
+    const sectionBox = section.getBoundingClientRect();
+    const pxX = box.left - sectionBox.left + cx * scale;
+    const tipW = tooltip.offsetWidth;
+    let tipX = pxX + 12;
+    if (tipX + tipW > sectionBox.width) {
+      tipX = pxX - 12 - tipW;
+    }
+    tooltip.style.left = Math.max(0, tipX) + "px";
+    tooltip.style.top = (box.top - sectionBox.top + top * scale) + "px";
+  }
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", hide);
+
+  plotBox.replaceChildren(svg);
+}
+
+function showHistory() {
+  const box = document.getElementById("charts");
+  if (lastHistory === null) {
+    box.replaceChildren();
+    return;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (box.children.length !== TIERS.length) {
+    box.replaceChildren();
+    for (const info of TIERS) {
+      const section = document.createElement("section");
+      section.className = "chart";
+      section.dataset.key = info.key;
+      const head = document.createElement("div");
+      head.className = "chart-head";
+      const plotBox = document.createElement("div");
+      plotBox.className = "plot-box";
+      const tooltip = document.createElement("div");
+      tooltip.className = "tooltip";
+      section.append(head, plotBox, tooltip);
+      box.appendChild(section);
+    }
+  }
+  for (let i = 0; i < TIERS.length; i++) {
+    const data = tierPoints(lastHistory[TIERS[i].key]);
+    const section = box.children[i];
+    section.style.display = data === null ? "none" : "";
+    if (data !== null) {
+      drawChart(section, TIERS[i], data, now);
+    }
+  }
+}
+
+async function refreshHistory() {
+  try {
+    const response = await fetch("history.json", { cache: "no-store" });
+    if (response.ok) {
+      const history = await response.json();
+      if (history !== null && typeof history === "object") {
+        lastHistory = history;
+      }
+    }
+  } catch (error) {
+    // No history (an older beacon, or not written yet): no charts.
+  }
+  showHistory();
+}
+
+let resizeTimer = 0;
+window.addEventListener("resize", function () {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(showHistory, 150);
+});
 
 // beacon writes status.json every 10 s; older than this, it's not running.
 const STALE_SECONDS = 60;
@@ -198,6 +604,8 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, REFRESH_MS);
+refreshHistory();
+setInterval(refreshHistory, HISTORY_REFRESH_MS);
 setInterval(show, 1000);
 </script>
 </body>

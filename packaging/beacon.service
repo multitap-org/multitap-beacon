@@ -8,6 +8,9 @@
 #   ExecStart=/usr/local/bin/beacon --status-file /run/beacon/status.json
 #   RuntimeDirectory=beacon
 #   RuntimeDirectoryMode=0755
+#   RuntimeDirectoryPreserve=yes
+# (history.json, the charts, lands next to status.json; /run keeps it across
+# beacon restarts but not reboots: see the README for a state directory.)
 
 [Unit]
 Description=beacon: introductions for piccolo remote play (never relays traffic)

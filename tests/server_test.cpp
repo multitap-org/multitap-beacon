@@ -642,7 +642,7 @@ static void test_status_file()
 
     // Written next to the test binary (ctest runs in the build directory).
     BeaconStatus status;
-    check(beacon_status_open(&status, "status_test.json"), "status opens");
+    check(beacon_status_open(&status, "status_test.json", 1), "status opens");
     // Before the ring is full: since the first sample.
     check(beacon_status_update(&status, 3, 100, 1), "status writes");
     check(beacon_status_update(&status, 3, 105, 2), "status writes again");
@@ -677,9 +677,10 @@ static void test_status_file()
     text[got] = '\0';
     check(strstr(text, "\"introductions_last_hour\": 720,") != nullptr, "introductions over the last hour");
     remove("status_test.json");
+    remove("history.json");
 
     BeaconStatus bad;
-    check(beacon_status_open(&bad, "/nonexistent-dir/status.json"), "status opens a bad path");
+    check(beacon_status_open(&bad, "/nonexistent-dir/status.json", 1), "status opens a bad path");
     check(!beacon_status_update(&bad, 1, 1, 1), "a write that fails returns false");
     check(bad.failing, "a failing write is remembered (logged once)");
 }

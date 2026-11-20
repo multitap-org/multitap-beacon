@@ -147,8 +147,9 @@ server; use a VPS then.
 
 ### Status page
 
-`packaging/status/` is a public page that shows how many piccolos the beacon
-can introduce right now, and how many introductions it made in the last hour.
+`packaging/status/` is a public page that shows how many clients are online
+on the beacon right now and how many pairings (introductions) it made in the
+last hour, with charts of the last 7 days, 30 days and 12 months below.
 beacon itself serves no HTTP: with `--status-file PATH` it writes counts
 (never ids or addresses) every 10 seconds, replacing the file atomically:
 
@@ -156,12 +157,26 @@ beacon itself serves no HTTP: with `--status-file PATH` it writes counts
 {"hosts_online": 12, "introductions_last_hour": 40, "updated": 1795000000}
 ```
 
+and `history.json` in the same directory, every 15 minutes and when it stops:
+three rings of `[bucket start, most hosts online in it, introductions in it]`
+(15-minute buckets for a week, hours for 30 days, UTC days for a year),
+about 60 KiB when full. beacon reads it back when it starts, so the charts
+survive restarts as long as the directory does; buckets while beacon was down
+show as gaps.
+
+```json
+{"updated": 1795000000,
+"week": {"bucket_seconds": 900, "points": [[1794999600, 12, 3], ...]},
+"month": {"bucket_seconds": 3600, "points": [...]},
+"year": {"bucket_seconds": 86400, "points": [...]}}
+```
+
 `hosts_online` counts the distinct host addresses with a live registration: a
 host registered over IPv4 and IPv6 counts once, two piccolos behind one public
 IP count twice. The page reads `status.json` next to itself every 30 seconds
 and says the beacon isn't answering when the file is older than a minute. Any
-web server that serves `index.html`, `piccolo-logo-dark.svg` and the status
-file from one directory works.
+web server that serves `index.html`, `piccolo-logo-dark.svg`, the status
+file and `history.json` from one directory works.
 
 **systemd + Caddy.** `systemctl edit beacon`:
 
@@ -171,13 +186,21 @@ ExecStart=
 ExecStart=/usr/local/bin/beacon --status-file /run/beacon/status.json
 RuntimeDirectory=beacon
 RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 ```
+
+(`/run` is emptied on reboot, so the charts start over then; beacon restarts
+keep them. To keep them across reboots, give beacon a fixed user instead of
+`DynamicUser`, `StateDirectory=beacon`, `StateDirectoryMode=0755` and
+`--status-file /var/lib/beacon/status.json`: with `DynamicUser` the state
+directory sits under `/var/lib/private`, which Caddy can't read.)
 
 and in the Caddyfile (the page copied to `/srv/beacon-status`):
 
 ```
 beacon.example.org {
-    handle /status.json {
+    @data path /status.json /history.json
+    handle @data {
         root * /run/beacon
         header Cache-Control no-store
         file_server

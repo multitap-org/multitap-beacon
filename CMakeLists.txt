@@ -124,6 +124,11 @@ if(BEACON_TESTS)
     beacon_set_flags(beacon_signal_test)
     add_test(NAME signal COMMAND beacon_signal_test)
 
+    add_executable(beacon_status_test tests/status_test.cpp)
+    target_link_libraries(beacon_status_test PRIVATE beacon_core)
+    beacon_set_flags(beacon_status_test)
+    add_test(NAME status COMMAND beacon_status_test)
+
     add_executable(beacon_loopback_test tests/loopback_test.cpp)
     target_link_libraries(beacon_loopback_test PRIVATE beacon_core)
     beacon_set_flags(beacon_loopback_test)
@@ -150,6 +155,11 @@ if(BEACON_TESTS)
     target_link_libraries(beacon_fuzz_ws_frame_replay PRIVATE beacon_core)
     beacon_set_flags(beacon_fuzz_ws_frame_replay)
     add_test(NAME fuzz_ws_frame_replay COMMAND beacon_fuzz_ws_frame_replay frame)
+
+    add_executable(beacon_fuzz_status_replay tests/fuzz_status_replay.cpp tests/fuzz_status.cpp)
+    target_link_libraries(beacon_fuzz_status_replay PRIVATE beacon_core)
+    beacon_set_flags(beacon_fuzz_status_replay)
+    add_test(NAME fuzz_status_replay COMMAND beacon_fuzz_status_replay)
 
     # The real libFuzzer target, with Clang and its runtime (Debian/Ubuntu:
     # libclang-rt-<version>-dev).
@@ -197,6 +207,13 @@ if(BEACON_TESTS)
         target_compile_options(beacon_fuzz_ws_frame PRIVATE -fsanitize=fuzzer,address,undefined)
         target_link_options(beacon_fuzz_ws_frame PRIVATE -fsanitize=fuzzer,address,undefined)
         add_test(NAME fuzz_ws_frame COMMAND beacon_fuzz_ws_frame -runs=2000000 -seed=1)
+
+        add_executable(beacon_fuzz_status tests/fuzz_status.cpp server/beacon_status.cpp server/beacon_log.cpp)
+        target_include_directories(beacon_fuzz_status PRIVATE server)
+        beacon_set_flags(beacon_fuzz_status)
+        target_compile_options(beacon_fuzz_status PRIVATE -fsanitize=fuzzer,address,undefined)
+        target_link_options(beacon_fuzz_status PRIVATE -fsanitize=fuzzer,address,undefined)
+        add_test(NAME fuzz_status COMMAND beacon_fuzz_status -runs=1000000 -seed=1)
     endif()
 endif()
 

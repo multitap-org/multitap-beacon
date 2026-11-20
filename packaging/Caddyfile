@@ -16,8 +16,10 @@ beacon.example.org {
     }
 
     # The status page (README.md, "Status page"): beacon --status-file
-    # /run/beacon/status.json, the page copied to /srv/beacon-status.
-    handle /status.json {
+    # /run/beacon/status.json (history.json lands next to it), the page
+    # copied to /srv/beacon-status.
+    @data path /status.json /history.json
+    handle @data {
         root * /run/beacon
         header Cache-Control no-store
         file_server
