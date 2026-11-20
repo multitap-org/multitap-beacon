@@ -521,6 +521,83 @@ static void test_public_address()
     beacon_server_destroy(&f.server);
 }
 
+// A header-only STUN Binding Request, as browsers send them.
+static void stun_request(uint8_t packet[20], uint8_t seed)
+{
+    const uint8_t header[8] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42};
+    memcpy(packet, header, 8);
+    for (uint32_t i = 8; i < 20; i++)
+    {
+        packet[i] = static_cast<uint8_t>(seed + i);
+    }
+}
+
+static void test_stun()
+{
+    Fixture f;
+    BeaconServerConfig config = {};
+    config.rate_per_second = 10;
+    config.burst = 5;
+    config.has_public_ipv4 = true;
+    config.public_ipv4 = ipv4(203, 0, 113, 200, 0);
+    check(fixture_create(&f, &config), "server creates");
+
+    uint8_t request[20];
+    stun_request(request, 1);
+    BeaconAddress client = ipv4(198, 51, 100, 7, 41000);
+    BeaconSocket sockets[] = {BeaconSocket::PRIMARY, BeaconSocket::SECONDARY, BeaconSocket::STUN};
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        beacon_server_receive(&f.server, f.now, sockets[i], &client, request, sizeof(request), &f.out);
+        check(f.out.count == 1 && f.out.packets[0].size == BEACON_STUN_RESPONSE_IPV4_SIZE &&
+                  f.out.packets[0].socket == sockets[i] && beacon_address_equal(&f.out.packets[0].to, &client),
+              "STUN is answered on every socket, from that socket");
+    }
+    uint8_t expected[BEACON_STUN_RESPONSE_IPV6_SIZE];
+    check(beacon_stun_encode_response(request + 8, &client, expected, sizeof(expected)) == 32 &&
+              memcmp(f.out.packets[0].data, expected, 32) == 0,
+          "the response maps the sender's address");
+
+    // IPv6 sender: 44 bytes.
+    BeaconAddress client6 = ipv6(4, 4, 42000);
+    beacon_server_receive(&f.server, f.now, BeaconSocket::PRIMARY, &client6, request, sizeof(request), &f.out);
+    check(f.out.count == 1 && f.out.packets[0].size == BEACON_STUN_RESPONSE_IPV6_SIZE, "IPv6 sender: 44 bytes");
+
+    // --public-address applies: a private sender gets the public IP, its own port.
+    BeaconAddress lan = ipv4(192, 168, 1, 9, 43000);
+    beacon_server_receive(&f.server, f.now, BeaconSocket::PRIMARY, &lan, request, sizeof(request), &f.out);
+    BeaconAddress reported = ipv4(203, 0, 113, 200, 43000);
+    check(beacon_stun_encode_response(request + 8, &reported, expected, sizeof(expected)) == 32 &&
+              f.out.count == 1 && memcmp(f.out.packets[0].data, expected, 32) == 0 &&
+              beacon_address_equal(&f.out.packets[0].to, &lan),
+          "a private STUN sender gets the public address, the reply goes to its real one");
+
+    // Malformed STUN is dropped and counted.
+    uint64_t malformed = f.server.stats.malformed;
+    request[1] = 0x11;
+    beacon_server_receive(&f.server, f.now, BeaconSocket::PRIMARY, &client, request, sizeof(request), &f.out);
+    check(f.out.count == 0 && f.server.stats.malformed == malformed + 1, "a Binding Indication is dropped");
+    request[1] = 0x01;
+
+    // The STUN-only socket answers no beacon message.
+    BeaconMessage bind = {};
+    bind.type = BeaconType::BIND;
+    BeaconAddress other = ipv4(198, 51, 100, 8, 41000);
+    send_message(&f, BeaconSocket::STUN, &other, &bind);
+    check(f.out.count == 0, "BIND on the STUN-only socket is dropped");
+
+    // Same rate limit as everything else: the client used 3 of its burst of 5.
+    uint32_t answered = 0;
+    for (uint32_t i = 0; i < 10; i++)
+    {
+        beacon_server_receive(&f.server, f.now, BeaconSocket::PRIMARY, &client, request, sizeof(request), &f.out);
+        answered += f.out.count;
+    }
+    check(answered == 2, "STUN shares the source's rate limit");
+    check(f.server.stats.stun == 7, "answered STUN requests are counted");
+    beacon_server_destroy(&f.server);
+}
+
 static void test_count_hosts()
 {
     Fixture f;
@@ -627,6 +704,7 @@ int main()
     test_rate_limit();
     test_families_and_rebinding();
     test_public_address();
+    test_stun();
     test_count_hosts();
     test_status_file();
     test_bad_config();

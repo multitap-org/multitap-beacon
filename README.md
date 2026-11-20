@@ -22,10 +22,14 @@ configuration file, no database, no disk.
    connection is encrypted and authenticated end to end (Noise XX, the same as
    on a LAN); the server never sees any of it.
 
+It is also a plain **STUN server** for browsers (WebRTC): standard Binding
+Requests on the same ports get the sender's public address back.
+
 The wire format is in [`PROTOCOL.md`](PROTOCOL.md): every message is a fixed
 size binary struct, nothing is ever read as a length or a string, and a reply
 is never bigger than the request that caused it (so the server can't be used
-to amplify attacks).
+to amplify attacks). The one exception is STUN, whose responses are 32 or 44
+bytes for a 20-byte request, as on every STUN server; the rate limits cap it.
 
 ## What it doesn't do
 
@@ -194,10 +198,12 @@ host `beacon-page`, port 80 (the containers must share a network with NPM).
 
 | port | protocol | what |
 |---|---|---|
-| 55430 | UDP | primary: address reflection, registration, introductions |
-| 55431 | UDP | secondary: address reflection only (NAT type detection) |
+| 55430 | UDP | primary: address reflection, registration, introductions, STUN |
+| 55431 | UDP | secondary: address reflection only (NAT type detection), STUN |
+| 3478 | UDP | optional (`--stun-port 3478`): STUN only, the standard STUN port |
 
-Nothing else, inbound or outbound. Without the secondary port
+Nothing else, inbound or outbound. Browsers use `stun:your.host.name:55430`;
+open 3478 only if you want the standard port too. Without the secondary port
 (`--secondary-port 0`) everything still works; clients just can't detect a
 symmetric NAT early.
 
@@ -208,6 +214,8 @@ symmetric NAT early.
                           IPv4 included)
 --port N                  primary UDP port (default 55430)
 --secondary-port N        secondary UDP port for NAT detection, 0 = off (default 55431)
+--stun-port N             an extra UDP port that answers STUN only, usually 3478; the primary
+                          and secondary ports answer STUN anyway (default 0 = off)
 --max-entries N           meeting ids kept at once (default 65536)
 --max-sources N           source addresses with their own rate limit (default 65536)
 --max-ids-per-source N    meeting ids one IPv4 address or IPv6 /64 may register (default 128)
@@ -257,12 +265,14 @@ cmake --build build-asan && ctest --test-dir build-asan
 ```
 
 Tests: `wire` (round trips, golden packets, every reject), `server` (the logic
-with a fake clock: cookies, expiry, limits, rate limits, address families),
-`loopback` (real sockets: a fake host registers, a fake client meets, both get
-each other's address), `fuzz_replay` (the fuzz target on every mutation of
-every message plus millions of random packets). With Clang and its sanitizer
-runtime (Debian / Ubuntu: `libclang-rt-<version>-dev`) there's also the
-libFuzzer target `beacon_fuzz_wire`:
+with a fake clock: cookies, expiry, limits, rate limits, address families,
+STUN), `stun` (RFC 5769's test vectors and every reject), `loopback` (real
+sockets: a fake host registers, a fake client meets, both get each other's
+address; STUN on every socket), `fuzz_replay` and `fuzz_stun_replay` (the
+fuzz targets on every mutation of a valid packet plus millions of random
+ones). With Clang and its sanitizer runtime (Debian / Ubuntu:
+`libclang-rt-<version>-dev`) there are also the libFuzzer targets
+`beacon_fuzz_wire` and `beacon_fuzz_stun`:
 
 ```sh
 CC=clang CXX=clang++ cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug

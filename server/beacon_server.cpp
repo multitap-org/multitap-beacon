@@ -477,36 +477,15 @@ static void handle_meet(BeaconServer* server, uint64_t now_ms, const BeaconAddre
     outbox_add(out, BeaconSocket::PRIMARY, &entry->reply_to, &reply);
 }
 
-void beacon_server_receive(BeaconServer* server, uint64_t now_ms, BeaconSocket socket,
-                               const BeaconAddress* from, const uint8_t* data, size_t size,
-                               BeaconOutbox* out)
+// The sender's rate limit: its own bucket, or the shared overflow bucket when
+// the source table has no room for it. `source_slot` gets its slot or NO_SLOT.
+static bool rate_allows(BeaconServer* server, uint64_t now_ms, const BeaconAddress* from, uint32_t* source_slot)
 {
-    out->count = 0;
-    server->stats.packets++;
-
-    // Decoding is cheaper than the rate limit's hash, and garbage gets no
-    // reply anyway, so it's dropped before it can take a source slot.
-    BeaconMessage request;
-    if (from->port == 0 || !beacon_decode(data, size, &request))
-    {
-        server->stats.malformed++;
-        return;
-    }
-
-    bool request_type = request.type == BeaconType::BIND ||
-                        (socket == BeaconSocket::PRIMARY &&
-                         (request.type == BeaconType::REGISTER || request.type == BeaconType::MEET));
-    if (!request_type)
-    {
-        server->stats.unexpected++;
-        return;
-    }
-
-    uint32_t source_slot = source_get(server, now_ms, from);
+    *source_slot = source_get(server, now_ms, from);
     bool allowed = false;
-    if (source_slot != NO_SLOT)
+    if (*source_slot != NO_SLOT)
     {
-        BeaconSource* source = &server->sources[source_slot];
+        BeaconSource* source = &server->sources[*source_slot];
         allowed = bucket_take(&source->tokens_milli, &source->last_ms, now_ms, server->config.rate_per_second,
                               server->config.burst);
     }
@@ -518,6 +497,79 @@ void beacon_server_receive(BeaconServer* server, uint64_t now_ms, BeaconSocket s
     if (!allowed)
     {
         server->stats.rate_limited++;
+    }
+    return allowed;
+}
+
+// A STUN Binding Request (beacon_stun.h): answered on every socket, with the
+// same rate limit as everything else. The response is 32 or 44 bytes for a
+// request of at least 20: the one reply larger than its request (PROTOCOL.md).
+static void handle_stun(BeaconServer* server, uint64_t now_ms, BeaconSocket socket, const BeaconAddress* from,
+                        const uint8_t* data, size_t size, BeaconOutbox* out)
+{
+    uint8_t transaction[BEACON_STUN_TRANSACTION_SIZE];
+    if (!beacon_stun_parse_request(data, size, transaction))
+    {
+        server->stats.malformed++;
+        return;
+    }
+    uint32_t source_slot = NO_SLOT;
+    if (!rate_allows(server, now_ms, from, &source_slot))
+    {
+        return;
+    }
+    server->stats.stun++;
+    BeaconAddress reported = reported_address(server, from);
+    BeaconOutPacket* packet = &out->packets[0];
+    packet->size = static_cast<uint32_t>(
+        beacon_stun_encode_response(transaction, &reported, packet->data, sizeof(packet->data)));
+    if (packet->size == 0)
+    {
+        return;
+    }
+    packet->socket = socket;
+    packet->to = *from;
+    out->count = 1;
+}
+
+void beacon_server_receive(BeaconServer* server, uint64_t now_ms, BeaconSocket socket,
+                               const BeaconAddress* from, const uint8_t* data, size_t size,
+                               BeaconOutbox* out)
+{
+    out->count = 0;
+    server->stats.packets++;
+    if (from->port == 0)
+    {
+        server->stats.malformed++;
+        return;
+    }
+    if (beacon_stun_looks_like_stun(data, size))
+    {
+        handle_stun(server, now_ms, socket, from, data, size, out);
+        return;
+    }
+
+    // Decoding is cheaper than the rate limit's hash, and garbage gets no
+    // reply anyway, so it's dropped before it can take a source slot.
+    BeaconMessage request;
+    if (!beacon_decode(data, size, &request))
+    {
+        server->stats.malformed++;
+        return;
+    }
+
+    bool request_type = (socket != BeaconSocket::STUN && request.type == BeaconType::BIND) ||
+                        (socket == BeaconSocket::PRIMARY &&
+                         (request.type == BeaconType::REGISTER || request.type == BeaconType::MEET));
+    if (!request_type)
+    {
+        server->stats.unexpected++;
+        return;
+    }
+
+    uint32_t source_slot = NO_SLOT;
+    if (!rate_allows(server, now_ms, from, &source_slot))
+    {
         return;
     }
 

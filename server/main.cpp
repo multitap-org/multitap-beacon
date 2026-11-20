@@ -30,6 +30,7 @@ struct Options
     const char* bind_address = "::";
     uint16_t primary_port = DEFAULT_PRIMARY_PORT;
     uint16_t secondary_port = DEFAULT_SECONDARY_PORT;  // 0 = no secondary socket
+    uint16_t stun_port = 0;                            // 0 = no extra STUN socket
     uint32_t stats_interval_seconds = 60;              // 0 = no stats lines
     const char* status_file = nullptr;                 // --status-file, nullptr = none
     BeaconServerConfig config = {};
@@ -49,6 +50,8 @@ static void print_usage(FILE* out)
             "                            IPv4 included)\n"
             "  --port N                  primary UDP port (default %u)\n"
             "  --secondary-port N        secondary UDP port for NAT detection, 0 = off (default %u)\n"
+            "  --stun-port N             an extra UDP port that answers STUN only, usually 3478; the primary\n"
+            "                            and secondary ports answer STUN anyway (default 0 = off)\n"
             "  --max-entries N           meeting ids kept at once (default %" PRIu32 ")\n"
             "  --max-sources N           source addresses with their own rate limit (default %" PRIu32 ")\n"
             "  --max-ids-per-source N    meeting ids one IPv4 address or IPv6 /64 may register (default %" PRIu32 ")\n"
@@ -182,6 +185,14 @@ static int parse_options(int argc, char** argv, Options* options)
                 return 1;
             }
         }
+        else if (strcmp(name, "--stun-port") == 0)
+        {
+            if (!parse_number(name, value, 0, 65535, &number))
+            {
+                return 1;
+            }
+            options->stun_port = static_cast<uint16_t>(number);
+        }
         else if (strcmp(name, "--max-sources") == 0)
         {
             if (!parse_number(name, value, 1, BEACON_MAX_TABLE_ITEMS, &options->config.max_sources))
@@ -259,6 +270,12 @@ static int parse_options(int argc, char** argv, Options* options)
         fprintf(stderr, "beacon: --port and --secondary-port must differ\n");
         return 1;
     }
+    if (options->stun_port != 0 &&
+        (options->stun_port == options->primary_port || options->stun_port == options->secondary_port))
+    {
+        fprintf(stderr, "beacon: --stun-port must differ from --port and --secondary-port\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -266,12 +283,12 @@ static void log_stats(const BeaconServer* server, const BeaconNet* net, uint32_t
 {
     const BeaconStats* s = &server->stats;
     beacon_log(BeaconLogLevel::info,
-                   "last %" PRIu32 " s: %" PRIu64 " packets, %" PRIu64 " bind, %" PRIu64 " register (%" PRIu64
+                   "last %" PRIu32 " s: %" PRIu64 " packets, %" PRIu64 " bind, %" PRIu64 " stun, %" PRIu64 " register (%" PRIu64
                    " cookie, %" PRIu64 " ids ok, %" PRIu64 " over source limit, %" PRIu64 " table full), %" PRIu64
                    " meet (%" PRIu64 " intro, %" PRIu64 " not found, %" PRIu64 " too soon), dropped %" PRIu64
                    " malformed, %" PRIu64 " unexpected, %" PRIu64 " rate; now %" PRIu32 " ids, %" PRIu32
                    " sources; %" PRIu64 " send errors, %" PRIu64 " oversized in total",
-                   seconds, s->packets, s->binds, s->registers, s->cookies_sent, s->ids_accepted,
+                   seconds, s->packets, s->binds, s->stun, s->registers, s->cookies_sent, s->ids_accepted,
                    s->ids_refused_source, s->ids_refused_full, s->meets, s->intros, s->not_found, s->intro_limited,
                    s->malformed, s->unexpected, s->rate_limited, s->entries, s->sources, net->send_errors,
                    net->oversized);
@@ -319,14 +336,13 @@ static void run(BeaconServer* server, BeaconNet* net, int signal_fd, uint32_t st
     bool running = true;
     while (running)
     {
-        pollfd fds[3] = {};
+        pollfd fds[4] = {};
         nfds_t count = 0;
         fds[count++] = pollfd{.fd = signal_fd, .events = POLLIN};
         fds[count++] = pollfd{.fd = net->primary_fd, .events = POLLIN};
-        if (net->secondary_fd >= 0)
-        {
-            fds[count++] = pollfd{.fd = net->secondary_fd, .events = POLLIN};
-        }
+        // -1 fds are ignored by poll, so the indexes stay fixed.
+        fds[count++] = pollfd{.fd = net->secondary_fd, .events = POLLIN};
+        fds[count++] = pollfd{.fd = net->stun_fd, .events = POLLIN};
         now = beacon_now_ms();
         int timeout = next_tick > now ? static_cast<int>(next_tick - now) : 0;
         int ready = poll(fds, count, timeout);
@@ -352,9 +368,13 @@ static void run(BeaconServer* server, BeaconNet* net, int signal_fd, uint32_t st
             {
                 beacon_net_drain(net, server, now, BeaconSocket::PRIMARY, PACKETS_PER_ROUND);
             }
-            if (count > 2 && (fds[2].revents & POLLIN) != 0)
+            if ((fds[2].revents & POLLIN) != 0)
             {
                 beacon_net_drain(net, server, now, BeaconSocket::SECONDARY, PACKETS_PER_ROUND);
+            }
+            if ((fds[3].revents & POLLIN) != 0)
+            {
+                beacon_net_drain(net, server, now, BeaconSocket::STUN, PACKETS_PER_ROUND);
             }
         }
         if (now >= next_tick)
@@ -399,7 +419,8 @@ int main(int argc, char** argv)
     }
     BeaconNet net;
     int32_t secondary = options.secondary_port == 0 ? -1 : options.secondary_port;
-    if (!beacon_net_open(&net, options.bind_address, options.primary_port, secondary))
+    int32_t stun = options.stun_port == 0 ? -1 : options.stun_port;
+    if (!beacon_net_open(&net, options.bind_address, options.primary_port, secondary, stun))
     {
         beacon_server_destroy(&server);
         close(signal_fd);
@@ -419,6 +440,10 @@ int main(int argc, char** argv)
     if (net.secondary_fd >= 0)
     {
         beacon_log(BeaconLogLevel::info, "secondary port: UDP %u", static_cast<unsigned>(net.secondary_port));
+    }
+    if (net.stun_fd >= 0)
+    {
+        beacon_log(BeaconLogLevel::info, "STUN-only port: UDP %u", static_cast<unsigned>(net.stun_port));
     }
 
     BeaconStatus status;

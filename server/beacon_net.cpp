@@ -9,10 +9,12 @@
 #include <netinet/in.h>
 #include <unistd.h>
 
-// Bigger than any message, so anything that fills it is known to be oversized
-// (MSG_TRUNC makes recvfrom return the real length).
-static constexpr size_t RECEIVE_BUFFER_SIZE = 256;
+// Bigger than any message and any STUN request we accept, so anything that
+// fills it is known to be oversized (MSG_TRUNC makes recvfrom return the real
+// length).
+static constexpr size_t RECEIVE_BUFFER_SIZE = 576;
 static_assert(RECEIVE_BUFFER_SIZE > BEACON_MAX_MESSAGE_SIZE, "receive buffer");
+static_assert(RECEIVE_BUFFER_SIZE > BEACON_STUN_MAX_REQUEST_SIZE, "receive buffer");
 
 uint64_t beacon_now_ms()
 {
@@ -158,7 +160,7 @@ static int open_socket(const char* bind_address, uint16_t port, int* family_out,
 }
 
 bool beacon_net_open(BeaconNet* net, const char* bind_address, uint16_t primary_port,
-                         int32_t secondary_port)
+                         int32_t secondary_port, int32_t stun_port)
 {
     *net = BeaconNet{};
     net->primary_fd = open_socket(bind_address, primary_port, &net->primary_family, &net->primary_port);
@@ -171,6 +173,15 @@ bool beacon_net_open(BeaconNet* net, const char* bind_address, uint16_t primary_
         net->secondary_fd = open_socket(bind_address, static_cast<uint16_t>(secondary_port), &net->secondary_family,
                                         &net->secondary_port);
         if (net->secondary_fd < 0)
+        {
+            beacon_net_close(net);
+            return false;
+        }
+    }
+    if (stun_port >= 0)
+    {
+        net->stun_fd = open_socket(bind_address, static_cast<uint16_t>(stun_port), &net->stun_family, &net->stun_port);
+        if (net->stun_fd < 0)
         {
             beacon_net_close(net);
             return false;
@@ -189,13 +200,35 @@ void beacon_net_close(BeaconNet* net)
     {
         close(net->secondary_fd);
     }
+    if (net->stun_fd >= 0)
+    {
+        close(net->stun_fd);
+    }
     *net = BeaconNet{};
+}
+
+static int socket_fd(const BeaconNet* net, BeaconSocket which, int* family)
+{
+    switch (which)
+    {
+        case BeaconSocket::PRIMARY:
+            *family = net->primary_family;
+            return net->primary_fd;
+        case BeaconSocket::SECONDARY:
+            *family = net->secondary_family;
+            return net->secondary_fd;
+        case BeaconSocket::STUN:
+            *family = net->stun_family;
+            return net->stun_fd;
+    }
+    *family = 0;
+    return -1;
 }
 
 static void send_packet(BeaconNet* net, const BeaconOutPacket* packet)
 {
-    int fd = packet->socket == BeaconSocket::PRIMARY ? net->primary_fd : net->secondary_fd;
-    int family = packet->socket == BeaconSocket::PRIMARY ? net->primary_family : net->secondary_family;
+    int family = 0;
+    int fd = socket_fd(net, packet->socket, &family);
     sockaddr_storage to = {};
     socklen_t length = 0;
     if (fd < 0 || !beacon_address_to_sockaddr(&packet->to, family, &to, &length))
@@ -214,7 +247,8 @@ static void send_packet(BeaconNet* net, const BeaconOutPacket* packet)
 uint32_t beacon_net_drain(BeaconNet* net, BeaconServer* server, uint64_t now_ms,
                               BeaconSocket which, uint32_t max_packets)
 {
-    int fd = which == BeaconSocket::PRIMARY ? net->primary_fd : net->secondary_fd;
+    int family = 0;
+    int fd = socket_fd(net, which, &family);
     if (fd < 0)
     {
         return 0;

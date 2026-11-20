@@ -1,4 +1,4 @@
-// End to end over real UDP sockets on loopback: the server's two dual-stack
+// End to end over real UDP sockets on loopback: the server's three dual-stack
 // sockets, a fake host on 127.0.0.1 (IPv4, arrives as ::ffff:127.0.0.1) and a
 // fake client on ::1 when the machine has IPv6 (127.0.0.1 otherwise).
 // Single-threaded: after each send the test lets the server drain its sockets.
@@ -78,8 +78,8 @@ static void peer_close(Peer* peer)
     *peer = Peer{};
 }
 
-// Sends `message` from `peer` to the server's `port` on loopback.
-static void peer_send(const Peer* peer, uint16_t port, const BeaconMessage* message)
+// Sends raw bytes from `peer` to the server's `port` on loopback.
+static void peer_send_raw(const Peer* peer, uint16_t port, const uint8_t* data, size_t size)
 {
     BeaconAddress server = {};
     if (peer->family == AF_INET6)
@@ -97,23 +97,87 @@ static void peer_send(const Peer* peer, uint16_t port, const BeaconMessage* mess
     sockaddr_storage to = {};
     socklen_t length = 0;
     beacon_address_to_sockaddr(&server, peer->family, &to, &length);
-    uint8_t packet[BEACON_MAX_MESSAGE_SIZE];
-    uint32_t size = beacon_encode(message, packet, sizeof(packet));
-    ssize_t sent = sendto(peer->fd, packet, size, 0, reinterpret_cast<const sockaddr*>(&to), length);
+    ssize_t sent = sendto(peer->fd, data, size, 0, reinterpret_cast<const sockaddr*>(&to), length);
     check(sent == static_cast<ssize_t>(size), "peer sends");
 }
 
-// Waits up to a second for one packet the server can read, then drains both sockets.
+// Sends `message` from `peer` to the server's `port` on loopback.
+static void peer_send(const Peer* peer, uint16_t port, const BeaconMessage* message)
+{
+    uint8_t packet[BEACON_MAX_MESSAGE_SIZE];
+    uint32_t size = beacon_encode(message, packet, sizeof(packet));
+    peer_send_raw(peer, port, packet, size);
+}
+
+// A STUN Binding Request to `port`, and the XOR-MAPPED-ADDRESS of the answer,
+// decoded here independently of beacon_stun (RFC 5389, section 15.2).
+static bool stun_exchange(const Peer* peer, BeaconNet* net, BeaconServer* server, uint16_t port, uint8_t seed,
+                          BeaconAddress* mapped, size_t* response_size);
+
+// Waits up to a second for one packet the server can read, then drains every socket.
 static void server_pump(BeaconNet* net, BeaconServer* server)
 {
-    pollfd fds[2] = {
+    pollfd fds[3] = {
         pollfd{.fd = net->primary_fd, .events = POLLIN},
         pollfd{.fd = net->secondary_fd, .events = POLLIN},
+        pollfd{.fd = net->stun_fd, .events = POLLIN},
     };
-    poll(fds, 2, 1000);
+    poll(fds, 3, 1000);
     uint64_t now = beacon_now_ms();
     beacon_net_drain(net, server, now, BeaconSocket::PRIMARY, 64);
     beacon_net_drain(net, server, now, BeaconSocket::SECONDARY, 64);
+    beacon_net_drain(net, server, now, BeaconSocket::STUN, 64);
+}
+
+static bool stun_exchange(const Peer* peer, BeaconNet* net, BeaconServer* server, uint16_t port, uint8_t seed,
+                          BeaconAddress* mapped, size_t* response_size)
+{
+    uint8_t request[20] = {0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42};
+    for (uint32_t i = 8; i < 20; i++)
+    {
+        request[i] = static_cast<uint8_t>(seed + i);
+    }
+    peer_send_raw(peer, port, request, sizeof(request));
+    server_pump(net, server);
+    pollfd fd = {.fd = peer->fd, .events = POLLIN};
+    if (poll(&fd, 1, 1000) <= 0)
+    {
+        return false;
+    }
+    uint8_t buffer[512];
+    ssize_t got = recv(peer->fd, buffer, sizeof(buffer), 0);
+    if (got < 32)
+    {
+        return false;
+    }
+    *response_size = static_cast<size_t>(got);
+    // Success response, same cookie and transaction id, then XOR-MAPPED-ADDRESS.
+    if (buffer[0] != 0x01 || buffer[1] != 0x01 || memcmp(buffer + 4, request + 4, 16) != 0 ||
+        buffer[20] != 0x00 || buffer[21] != 0x20)
+    {
+        return false;
+    }
+    *mapped = BeaconAddress{};
+    mapped->port = static_cast<uint16_t>(((buffer[26] << 8) | buffer[27]) ^ 0x2112);
+    if (buffer[25] == 0x01 && got == 32)
+    {
+        mapped->ip[10] = 0xff;
+        mapped->ip[11] = 0xff;
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            mapped->ip[12 + i] = static_cast<uint8_t>(buffer[28 + i] ^ buffer[4 + i]);
+        }
+        return true;
+    }
+    if (buffer[25] == 0x02 && got == 44)
+    {
+        for (uint32_t i = 0; i < 16; i++)
+        {
+            mapped->ip[i] = static_cast<uint8_t>(buffer[28 + i] ^ buffer[4 + i]);
+        }
+        return true;
+    }
+    return false;
 }
 
 // Waits up to `timeout_ms` for one message on `peer`.
@@ -149,10 +213,10 @@ int main()
     BeaconServer server;
     check(beacon_server_create(&server, &config, beacon_now_ms()), "server creates");
     BeaconNet net;
-    if (!beacon_net_open(&net, "::", 0, 0))
+    if (!beacon_net_open(&net, "::", 0, 0, 0))
     {
         // No IPv6 at all: the IPv4 fallback.
-        check(beacon_net_open(&net, "0.0.0.0", 0, 0), "server sockets open");
+        check(beacon_net_open(&net, "0.0.0.0", 0, 0, 0), "server sockets open");
     }
     bool server_has_ipv6 = net.primary_family == AF_INET6;
 
@@ -237,6 +301,25 @@ int main()
     peer_send(&host, net.primary_port, &meet);
     server_pump(&net, &server);
     check(peer_receive(&host, 1000, &r) && r.type == BeaconType::NOT_FOUND, "nothing stored without a cookie");
+
+    // STUN on the primary port and on the STUN-only port: an IPv4 sender gets
+    // its IPv4 address (32 bytes), an IPv6 one its IPv6 address (44 bytes).
+    BeaconAddress mapped;
+    size_t response_size = 0;
+    check(stun_exchange(&host, &net, &server, net.primary_port, 1, &mapped, &response_size) &&
+              response_size == 32 && beacon_address_equal(&mapped, &host.address),
+          "STUN on the primary port answers the IPv4 host with its address");
+    check(stun_exchange(&host, &net, &server, net.stun_port, 2, &mapped, &response_size) &&
+              beacon_address_equal(&mapped, &host.address),
+          "STUN on the STUN-only port");
+    check(stun_exchange(&client, &net, &server, net.secondary_port, 3, &mapped, &response_size) &&
+              response_size == (client_ipv6 ? 44u : 32u) && beacon_address_equal(&mapped, &client.address),
+          "STUN on the secondary port, IPv6 when the client is on ::1");
+    // The STUN-only port answers nothing else.
+    bind.nonce = 0x3333;
+    peer_send(&client, net.stun_port, &bind);
+    server_pump(&net, &server);
+    check(!peer_receive(&client, 100, &r), "BIND on the STUN-only port gets no reply");
 
     // An oversized packet and junk get nothing back.
     uint8_t big[1500] = {'M', 'T', 'B', 'C', 1, 1};

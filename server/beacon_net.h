@@ -1,6 +1,7 @@
 #pragma once
 
-// beacon_net: the server's two UDP sockets (Linux). Each is one dual-stack
+// beacon_net: the server's UDP sockets (Linux): primary, secondary and the
+// optional STUN one. Each is one dual-stack
 // IPv6 socket that also takes IPv4 (as ::ffff:a.b.c.d), unless the bind
 // address is an IPv4 one or the machine has no IPv6 (then plain IPv4).
 
@@ -13,18 +14,21 @@ struct BeaconNet
 {
     int primary_fd = -1;
     int secondary_fd = -1;          // -1 when the secondary port is off
+    int stun_fd = -1;               // -1 when --stun-port is off
     int primary_family = 0;         // AF_INET6 or AF_INET
     int secondary_family = 0;
+    int stun_family = 0;
     uint16_t primary_port = 0;      // the bound ports (useful when 0 asked for any)
     uint16_t secondary_port = 0;
+    uint16_t stun_port = 0;
     uint64_t send_errors = 0;
-    uint64_t oversized = 0;         // packets larger than any message (dropped before decoding)
+    uint64_t oversized = 0;         // packets larger than any message or STUN request (dropped)
 };
 
 // `bind_address` is a numeric IPv6 or IPv4 address ("::" for every address).
-// Port 0 picks a free port; `secondary_port` -1 means no secondary socket.
+// Port 0 picks a free port; `secondary_port` / `stun_port` -1 means no such socket.
 bool beacon_net_open(BeaconNet* net, const char* bind_address, uint16_t primary_port,
-                         int32_t secondary_port);
+                         int32_t secondary_port, int32_t stun_port);
 void beacon_net_close(BeaconNet* net);
 
 // Reads up to `max_packets` waiting packets from one socket (without

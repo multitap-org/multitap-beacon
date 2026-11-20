@@ -79,7 +79,8 @@ add_library(beacon_core STATIC
     server/beacon_random.cpp
     server/beacon_server.cpp
     server/beacon_net.cpp
-    server/beacon_status.cpp)
+    server/beacon_status.cpp
+    server/beacon_stun.cpp)
 target_include_directories(beacon_core PUBLIC server)
 target_link_libraries(beacon_core PUBLIC beacon_wire PRIVATE beacon_dep_monocypher)
 beacon_set_flags(beacon_core)
@@ -106,6 +107,11 @@ if(BEACON_TESTS)
     beacon_set_flags(beacon_server_test)
     add_test(NAME server COMMAND beacon_server_test)
 
+    add_executable(beacon_stun_test tests/stun_test.cpp)
+    target_link_libraries(beacon_stun_test PRIVATE beacon_core)
+    beacon_set_flags(beacon_stun_test)
+    add_test(NAME stun COMMAND beacon_stun_test)
+
     add_executable(beacon_loopback_test tests/loopback_test.cpp)
     target_link_libraries(beacon_loopback_test PRIVATE beacon_core)
     beacon_set_flags(beacon_loopback_test)
@@ -117,6 +123,11 @@ if(BEACON_TESTS)
     target_link_libraries(beacon_fuzz_replay PRIVATE beacon_wire)
     beacon_set_flags(beacon_fuzz_replay)
     add_test(NAME fuzz_replay COMMAND beacon_fuzz_replay)
+
+    add_executable(beacon_fuzz_stun_replay tests/fuzz_stun_replay.cpp tests/fuzz_stun.cpp)
+    target_link_libraries(beacon_fuzz_stun_replay PRIVATE beacon_core)
+    beacon_set_flags(beacon_fuzz_stun_replay)
+    add_test(NAME fuzz_stun_replay COMMAND beacon_fuzz_stun_replay)
 
     # The real libFuzzer target, with Clang and its runtime (Debian/Ubuntu:
     # libclang-rt-<version>-dev).
@@ -133,7 +144,7 @@ if(BEACON_TESTS)
         if(BEACON_LIBFUZZER_LINKS)
             set(BEACON_HAVE_LIBFUZZER ON)
         else()
-            message(STATUS "beacon: Clang without the libFuzzer/sanitizer runtime: no beacon_fuzz_wire")
+            message(STATUS "beacon: Clang without the libFuzzer/sanitizer runtime: no beacon_fuzz_wire / beacon_fuzz_stun")
         endif()
     endif()
     if(BEACON_HAVE_LIBFUZZER)
@@ -143,6 +154,13 @@ if(BEACON_TESTS)
         target_compile_options(beacon_fuzz_wire PRIVATE -fsanitize=fuzzer,address,undefined)
         target_link_options(beacon_fuzz_wire PRIVATE -fsanitize=fuzzer,address,undefined)
         add_test(NAME fuzz_wire COMMAND beacon_fuzz_wire -runs=2000000 -seed=1)
+
+        add_executable(beacon_fuzz_stun tests/fuzz_stun.cpp server/beacon_stun.cpp wire/beacon_wire.cpp)
+        target_include_directories(beacon_fuzz_stun PRIVATE wire server)
+        beacon_set_flags(beacon_fuzz_stun)
+        target_compile_options(beacon_fuzz_stun PRIVATE -fsanitize=fuzzer,address,undefined)
+        target_link_options(beacon_fuzz_stun PRIVATE -fsanitize=fuzzer,address,undefined)
+        add_test(NAME fuzz_stun COMMAND beacon_fuzz_stun -runs=2000000 -seed=1)
     endif()
 endif()
 

@@ -19,7 +19,7 @@ lengths taken from the wire.
 - UDP only. Server listens on two ports: PRIMARY (default 55430) and SECONDARY (55431, for
   NAT-type detection). IPv6 and IPv4 on one dual-stack socket each (IPv4-mapped).
 - PRIMARY answers BIND, REGISTER and MEET. SECONDARY answers BIND only (anything else there is
-  dropped).
+  dropped). Both also answer STUN Binding Requests (see STUN).
 - Every message starts with an 8-byte header:
   `magic "MTBC"` (4) | `version 1` (1) | `type` (1) | `reserved 0` (2).
 - Each type has ONE exact total size (table below). A packet is dropped silently when its size
@@ -31,9 +31,12 @@ lengths taken from the wire.
   | 2 bytes zero. Port 0 is invalid.
 - Meeting id (16 bytes): all zero is invalid.
 - Anti-amplification: every reply to the sender is the same size or smaller than the request
-  (requests are padded with zeros to their reply's size). The server sends to a third address
-  only in one case: the INTRO to a host that registered with a valid cookie (so it proved it
-  receives at that address), at most 4 per second per registration.
+  (requests are padded with zeros to their reply's size), with ONE exception, STUN (below). The
+  server sends to a third address only in one case: the INTRO to a host that registered with a
+  valid cookie (so it proved it receives at that address), at most 4 per second per
+  registration.
+- STUN shares the sockets: a packet whose first byte has its two top bits zero (0x00-0x3F,
+  RFC 7983) is STUN; "MTBC" starts with 0x4D. See "STUN" below.
 
 ## Messages
 
@@ -96,10 +99,33 @@ REGISTERED's accepted is 0-8; every address has a non-zero port and zero padding
 - The host accepts INTRO only from the configured server's address and only for ids it
   registered; the client accepts INTRO / NOT_FOUND only for its pending MEET's nonce and id.
 
+## STUN
+
+beacon is also a plain STUN server for browsers (WebRTC's `iceServers:
+[{urls: "stun:<beacon>:55430"}]`): it answers RFC 5389 / 8489 Binding Requests on PRIMARY,
+SECONDARY and, if the operator opens it, a STUN-only port (`--stun-port`, usually 3478, off by
+default; that socket answers STUN and nothing else).
+
+- Accepted: exactly type 0x0001 (Binding Request) with the magic cookie 0x2112A442; size 20-548
+  bytes, a multiple of 4, equal to 20 + the length field; the attributes (4-byte header, value
+  padded to 4) fill the body exactly. Their contents are never read (no MESSAGE-INTEGRITY, no
+  FINGERPRINT check: public STUN). Anything else is dropped silently: indications, responses,
+  other methods, RFC 3489 requests without the cookie. No error responses are ever sent.
+- Response: Binding Success (0x0101), same transaction id, one attribute: XOR-MAPPED-ADDRESS
+  with the address beacon would report in BOUND (`--public-address` applies). 32 bytes for an
+  IPv4 sender (an IPv4-mapped address is answered as family 0x01), 44 for IPv6.
+- Same per-source rate limit as every other message.
+- **The amplification exception:** browsers send header-only requests (20 bytes) and beacon
+  can't make them pad, so a response is 1.6x the request for IPv4 (32 / 20) and 2.2x for IPv6
+  (44 / 20). That's what every public STUN server does; the per-source token bucket and the
+  overflow bucket cap what any one spoofed address can receive.
+
 ## Security notes
 
 - The server never parses anything variable: every message is a fixed struct, checked field by
-  field. Fuzzed (libFuzzer) with a decode -> encode round-trip check.
+  field. Fuzzed (libFuzzer) with a decode -> encode round-trip check. The one exception is STUN's
+  attribute list, which is only walked to check that it fits (bounded, every step checked
+  against the end) and is fuzzed on its own.
 - The server is not authenticated in v1 (phase 2: signed directory). A spoofed INTRO can at
   most make a peer send PUNCHes (32 bytes, 50 of them) to some address, and only for an id the
   peer has registered or asked for.
@@ -139,3 +165,5 @@ REGISTERED's accepted is 0-8; every address has a non-zero port and zero padding
 - Per-registration INTRO limit (4/s), per-source limits defined by IPv4 address / IPv6 /64,
   overflow bucket for sources that don't fit the table.
 - REGISTER and MEET must come from the ENet socket; SECONDARY answers BIND only.
+- STUN Binding (for browsers) on PRIMARY and SECONDARY, and on an optional STUN-only port;
+  the one reply larger than its request (2026-11-20, WebRTC plan step 2).

@@ -17,6 +17,7 @@
 // scans the whole window, so freeing a slot never breaks another item's search
 // (no tombstones, no moving items).
 
+#include "beacon_stun.h"
 #include "beacon_wire.h"
 
 #include <cstdint>
@@ -58,13 +59,14 @@ enum class BeaconSocket : uint8_t
 {
     PRIMARY,
     SECONDARY,
+    STUN,           // --stun-port (3478): STUN Binding Requests only
 };
 
 struct BeaconOutPacket
 {
     BeaconSocket socket = BeaconSocket::PRIMARY;
     BeaconAddress to = {};
-    uint8_t data[BEACON_MAX_MESSAGE_SIZE] = {};
+    uint8_t data[BEACON_MAX_MESSAGE_SIZE] = {};   // STUN responses (44 bytes at most) fit too
     uint32_t size = 0;
 };
 
@@ -86,6 +88,7 @@ struct BeaconStats
     uint64_t unexpected = 0;         // valid but not for the server here (a reply type, REGISTER on SECONDARY...)
     uint64_t rate_limited = 0;
     uint64_t binds = 0;
+    uint64_t stun = 0;               // STUN Binding Requests answered
     uint64_t registers = 0;
     uint64_t cookies_sent = 0;       // REGISTER without a valid cookie
     uint64_t ids_accepted = 0;
