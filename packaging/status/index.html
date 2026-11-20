@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>beacon status</title>
-<meta name="description" content="How many piccolos this beacon can introduce right now.">
+<meta name="description" content="How many clients are online on this beacon right now.">
 <link rel="icon" href="piccolo-logo-dark.svg">
 <style>
   /* piccolo's BLUE theme, dark page (assets/branding/README.md in piccolo). */
@@ -156,9 +156,9 @@ function show() {
   }
   const hosts = lastStatus.hosts_online;
   drawText("count", String(hosts), 16, "accent");
-  drawText("label", hosts === 1 ? "piccolo online" : "piccolos online", 4, "text");
+  drawText("label", hosts === 1 ? "client online" : "clients online", 4, "text");
   const intros = lastStatus.introductions_last_hour;
-  drawText("intros", intros + (intros === 1 ? " introduction" : " introductions") + " in the last hour", 3, "dim");
+  drawText("intros", intros + (intros === 1 ? " pairing" : " pairings") + " in the last hour", 3, "dim");
   drawText("updated", "updated " + ago(now - lastStatus.updated), 3, "dim");
 }
 
