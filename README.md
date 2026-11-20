@@ -87,12 +87,27 @@ only IPv4 / IPv6 sockets.
 
 ### With Docker
 
+Every push to `main` publishes `ghcr.io/multitap-org/beacon:latest` (amd64 and
+arm64; version tags as `:X.Y.Z`):
+
 ```sh
-git clone --recursive https://github.com/multitap-org/multitap-beacon.git
-cd multitap-beacon
-docker build -t beacon .
-docker run -d --name beacon --restart unless-stopped --network host beacon
+docker run -d --name beacon --restart unless-stopped --network host ghcr.io/multitap-org/beacon:latest
 ```
+
+In a compose file:
+
+```yaml
+  beacon:
+    image: ghcr.io/multitap-org/beacon:latest
+    restart: unless-stopped
+    network_mode: host
+    command: ["--status-file", "/status/status.json"]
+    volumes:
+      - ./beacon-status:/status    # owned by uid 65534 (nobody)
+```
+
+To build it yourself instead: `git clone --recursive` this repository and
+`docker build -t beacon .` in it.
 
 Use `--network host`. The server's whole job is to see where packets really
 come from, and Docker's port publishing can hide that (through docker-proxy,

@@ -4,6 +4,8 @@
 #   docker build -t beacon .
 #   docker run -d --name beacon --restart unless-stopped --network host beacon
 #
+# .github/workflows/image.yml publishes it as ghcr.io/multitap-org/beacon.
+#
 # Use --network host: the server's whole job is to see the senders' real
 # addresses, and Docker's port publishing can rewrite them (always for IPv6
 # through docker-proxy). Options go after the image name (beacon --help).
