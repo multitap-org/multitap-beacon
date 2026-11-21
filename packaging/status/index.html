@@ -45,6 +45,15 @@
   }
   .tooltip .dim { color: var(--muted); }
   noscript { color: var(--muted); }
+  /* What the beacon is: for anyone who wonders whether it tracks them. */
+  .lede { margin: -12px 0 0; max-width: 46em; color: var(--muted); }
+  .about { padding: 22px 24px; display: grid; gap: 14px; scroll-margin-top: 16px; }
+  .about h2 { margin: 0; font-size: 26px; text-shadow: none; }
+  .about p { margin: 0; max-width: 46em; }
+  .about dl { margin: 0; display: grid; grid-template-columns: minmax(0, 14em) minmax(0, 1fr); gap: 10px 24px; }
+  .about dt { font-weight: 700; color: var(--heading-accent); }
+  .about dd { margin: 0; color: var(--muted); }
+  @media (max-width: 600px) { .about dl { grid-template-columns: 1fr; gap: 2px; } .about dd { margin-bottom: 10px; } }
 </style>
 </head>
 <body data-site="status">
@@ -68,12 +77,38 @@
     <h1>Beacon status</h1>
     <span class="state" id="updated"></span>
   </div>
+  <p class="lede">The beacon introduces your own paired devices (a piccolo and piccoletto) across the internet,
+    so they can connect to each other directly. It never sees your games, and it doesn't track anyone.
+    <a href="#about">What it sees and keeps</a>.</p>
   <div class="numbers">
     <div class="panel number"><b id="count">?</b><span id="label">clients online</span></div>
     <div class="panel number"><b id="intros">?</b><span id="intros-label">pairings in the last hour</span></div>
   </div>
   <div class="charts" id="charts"></div>
   <noscript>This page needs JavaScript to read status.json and history.json.</noscript>
+  <section class="panel about" id="about">
+    <h2>What the beacon is</h2>
+    <p>At home, piccolo and piccoletto find each other on your own network and never use the beacon.
+      Away from home (on mobile data, or from a browser), two devices that are already paired need someone
+      to tell each one where the other is on the internet. That's all the beacon does: it introduces them,
+      then they talk directly.</p>
+    <dl>
+      <dt>What goes through it</dt>
+      <dd>A few small packets to meet. Your games, picture, sound and controls never do: they go directly
+        between your devices, encrypted end to end, and the beacon can't read them. If your devices can't
+        reach each other directly, they don't connect; the beacon never relays anything.</dd>
+      <dt>What it sees</dt>
+      <dd>While a piccolo with INTERNET on is online: its public address and port, which every server you
+        talk to sees, and one anonymous meeting id per paired device, a hash the beacon can't tie to a device,
+        a key or a person. Each is forgotten 60 seconds after the piccolo stops refreshing it.</dd>
+      <dt>What it keeps</dt>
+      <dd>Only the counts on this page: how many piccolos are online and how many introductions it made.
+        No accounts, no names, no addresses, no ids, nothing on disk but those counts.</dd>
+      <dt>Who runs it</dt>
+      <dd>The Multitap project runs this one. It's free software (MIT): read the code or run your own on
+        <a href="https://github.com/multitap-org/multitap-beacon">GitHub</a>.</dd>
+    </dl>
+  </section>
 </main>
 <!-- sites-footer (tools/sync-snippets.sh) -->
 <footer class="sites-foot">
