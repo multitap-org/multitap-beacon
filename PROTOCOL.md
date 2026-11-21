@@ -9,7 +9,7 @@ Goal: two piccolo-family programs that are ALREADY paired (piccolo host + piccol
 find each other across the internet. The server reflects public addresses (STUN-like) and
 introduces peers; both sides then punch through NAT on their own ENet socket. NO relay, ever:
 if punching fails, the client says "couldn't connect". Decisions (Andrés): free software, MIT,
-easy to self-host, server configurable in piccolo with one default; C++ (project STYLE.md).
+easy to self-host, server configurable in piccolo with one default; C++.
 Later (phase 2): a signed central directory of servers. The protocol must never let anyone
 make the server (or a peer) run anything: fixed-size binary messages only, no strings, no
 lengths taken from the wire.
@@ -205,7 +205,7 @@ header to the client's address (it ignores what clients send unless told to trus
 
 ## Server program (repo multitap-org/multitap-beacon, MIT)
 
-- One small C++20 binary (STYLE.md: C-like, no auto / lambdas / templates / exceptions), only
+- One small C++20 binary (C-like, no auto / lambdas / templates / exceptions), only
   libc + sockets (Linux; other POSIX / Windows later if cheap) + Monocypher (submodule) for the
   cookie and table hashing. Wire format in its own small library (`beacon_wire.h/.cpp`,
   no dependencies) that frontends-common will also use (submodule in piccolo's deps/); it has

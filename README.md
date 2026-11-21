@@ -361,7 +361,7 @@ devices, so one core serves far more hosts than the tables hold.
 
 ## Development
 
-C++20 written like C ([`STYLE.md`](STYLE.md)). Linux for now; the wire library
+C++20 written like C. Linux for now; the wire library
 ([`wire/beacon_wire.h`](wire/beacon_wire.h)) has no dependencies and
 builds anywhere: clients use it as a submodule (the server and tests are off
 when this repo is added as a CMake subproject).
