@@ -53,6 +53,15 @@ bytes for a 20-byte request, as on every STUN server; the rate limits cap it.
   directory of servers. The peers authenticate each other, so a rogue server
   can at worst fail to introduce them.
 
+## Planned: the netplay lobby
+
+The netplay lobby will live here too, in this server and on its status page:
+a list of the open netplay rooms, so players can find a game to join. piccolo
+has no netplay yet, so there's no design: what a room shows, how long it's
+listed and how joining works are all open. One thing is decided: a room is
+listed only when its host chooses to make it public. Pairing introductions stay
+as they are, anonymous and never listed.
+
 ## Self-hosting in a few minutes
 
 Any Linux machine with a public IP works (a small VPS is plenty: the default
