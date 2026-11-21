@@ -1,0 +1,51 @@
+# Keeps the status page's copy of the sites' shared look
+# (packaging/status/_site/v1) in step with get-piccolo.app/assets/v1
+# (piccolo-site's assets/README.md). Every day: fetch it; when it changed,
+# open (or update) a pull request with the new copy and the page's sites bar
+# and footer. Merging it rebuilds the image like any push to main.
+# Needs "Allow GitHub Actions to create and approve pull requests" in the
+# repository's Settings > Actions > General.
+name: Site look
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the site's look
+        id: fetch
+        run: |
+          set +e
+          tools/fetch-site-assets.sh packaging/status/_site/v1
+          rc=$?
+          set -e
+          case $rc in
+            0) tools/sync-snippets.sh packaging/status/_site/v1 packaging/status/index.html
+               echo "changed=true" >> "$GITHUB_OUTPUT" ;;
+            2) echo "already current" ;;
+            *) echo "::warning::get-piccolo.app/assets/v1 couldn't be fetched" ;;
+          esac
+      - name: Pull request
+        if: steps.fetch.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git diff --quiet && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B site-look
+          git add -A packaging/status
+          git commit -q -m "Status page: the sites' look from get-piccolo.app"
+          git push -f origin site-look
+          gh pr view site-look --json state -q .state 2>/dev/null | grep -q OPEN ||
+            gh pr create --head site-look --base main --title "Status page: the sites' look from get-piccolo.app" \
+              --body "get-piccolo.app/assets/v1 changed; this is the status page's copy (packaging/status/_site/v1) and its sites bar and footer, fetched and checked against the site's MANIFEST."

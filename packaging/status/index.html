@@ -3,196 +3,115 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>beacon status</title>
-<meta name="description" content="How many clients are online on this beacon right now.">
-<link rel="icon" href="piccolo-logo-dark.svg">
+<meta name="color-scheme" content="dark light">
+<title>piccolo status: beacon</title>
+<meta name="description" content="How many clients are online on this beacon right now, and over the last week, month and year.">
+<link rel="icon" href="_site/v1/img/piccolo-icon-small.svg" type="image/svg+xml">
+<!-- The look all piccolo websites share (piccolo-site's assets/README.md):
+     a copy next to this page, so the page stands on its own. -->
+<link rel="stylesheet" href="_site/v1/site.css">
 <style>
-  /* piccolo's BLUE theme, dark page (assets/branding/README.md in piccolo). */
-  :root {
-    --background: #2A4068;
-    --text: #E0E6F0;
-    --shadow: #101828;
-    --accent: #FFC93C;
-    --dim: #8FA0BF;
-    --grid: #3A5482;
+  /* This page's own parts; colors, fonts, sites bar and footer are site.css. */
+  main.wrap { padding-top: 40px; padding-bottom: 48px; display: grid; gap: 28px; }
+  .status-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px; }
+  .status-head h1 { margin: 0; }
+  .state { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; }
+  .state::before { content: ""; width: 10px; height: 10px; background: var(--good); }
+  .state.down::before { background: var(--accent); }
+  .numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+  .number { padding: 18px 20px; display: grid; gap: 4px; }
+  .number b {
+    font: 600 52px/1 var(--font-heading); color: var(--accent); font-variant-numeric: tabular-nums;
+    text-shadow: 3px 3px 0 var(--shadow);
   }
-  html, body { margin: 0; background: var(--background); color: var(--text); }
-  body {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 40px;
-    padding: 32px 16px;
-    box-sizing: border-box;
-    font-family: system-ui, sans-serif;
-  }
-  .logo { width: 320px; max-width: 100%; height: auto; }
-  /* Text is drawn with piccolo's 5x5 pixel font as SVG rectangles (below). */
-  .pixel { display: block; max-width: 100%; height: auto; shape-rendering: crispEdges; }
-  .stack { display: flex; flex-direction: column; align-items: center; gap: 16px; }
-  .text { fill: var(--text); }
-  .accent { fill: var(--accent); }
-  .dim { fill: var(--dim); }
-  .shadow { fill: var(--shadow); }
-  noscript { font-size: 14px; }
-  /* History charts: one per resolution, stacked. */
-  .charts { display: flex; flex-direction: column; gap: 32px; width: 100%; max-width: 760px; }
-  .chart { display: flex; flex-direction: column; gap: 10px; position: relative; }
-  .chart-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+  .number span { font-size: 12px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  @media (prefers-color-scheme: light) { .number b { color: var(--text); } }
+  /* History charts: one panel per resolution. */
+  .charts { display: grid; gap: 24px; }
+  .chart { padding: 16px 18px 12px; display: flex; flex-direction: column; gap: 10px; position: relative; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 4px 12px; flex-wrap: wrap; }
+  .chart-head .title { font-size: 13px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+  .chart-head .dim { font-size: 13px; color: var(--muted); }
   .chart svg.plot { display: block; width: 100%; height: auto; touch-action: pan-y; }
   .grid { stroke: var(--grid); stroke-width: 1; shape-rendering: crispEdges; }
+  .axis { fill: var(--muted); font: 400 11px var(--font-text); }
   .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-  .area { fill: var(--accent); fill-opacity: 0.12; stroke: none; }
-  .cross { stroke: var(--dim); stroke-width: 1; shape-rendering: crispEdges; }
-  .marker { fill: var(--accent); stroke: var(--background); stroke-width: 2; }
+  .area { fill: var(--accent); fill-opacity: 0.14; stroke: none; }
+  .cross { stroke: var(--muted); stroke-width: 1; shape-rendering: crispEdges; }
+  .marker { fill: var(--accent); stroke: var(--band); stroke-width: 2; }
   .tooltip {
-    position: absolute; pointer-events: none; display: none;
-    background: var(--shadow); padding: 8px 10px; border-radius: 4px;
-    flex-direction: column; gap: 6px;
+    position: absolute; pointer-events: none; display: none; flex-direction: column; gap: 2px;
+    background: var(--bg); border: 2px solid var(--edge); padding: 6px 10px; font-size: 13px; white-space: nowrap;
   }
+  .tooltip .dim { color: var(--muted); }
+  noscript { color: var(--muted); }
 </style>
 </head>
-<body>
-<img class="logo" src="piccolo-logo-dark.svg" alt="piccolo">
-<div class="stack">
-  <div id="count"></div>
-  <div id="label"></div>
-</div>
-<div id="intros"></div>
-<div id="updated"></div>
-<div class="charts" id="charts"></div>
-<noscript>This page needs JavaScript to read status.json and history.json.</noscript>
+<body data-site="status">
+<!-- sites-header (tools/sync-snippets.sh) -->
+<header class="sites-bar">
+  <div class="wrap sites-bar-row">
+    <a class="sites-brand" href="https://get-piccolo.app/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="12" fill="#1A2840"/><rect x="8" y="26" width="24" height="10" fill="#E0E6F0"/><rect x="15" y="19" width="10" height="24" fill="#E0E6F0"/><circle cx="43" cy="38" r="7" fill="#FFC93C"/><circle cx="53" cy="26" r="7" fill="#E0E6F0"/></svg> piccolo</a>
+    <nav class="sites-nav" aria-label="piccolo's sites">
+      <a data-site="home" href="https://get-piccolo.app/">Home</a>
+      <a data-site="play" href="https://get-piccolo.app/play/">Play</a>
+      <a data-site="cores" href="https://cores.get-piccolo.app/cores/">Cores</a>
+      <a data-site="releases" href="https://releases.get-piccolo.app/">Releases</a>
+      <a data-site="status" href="https://beacon.get-piccolo.app/status/">Status</a>
+      <a href="https://github.com/multitap-org/piccolo">GitHub</a>
+    </nav>
+  </div>
+</header>
+<!-- /sites-header -->
+<main class="wrap">
+  <div class="status-head">
+    <h1>Beacon status</h1>
+    <span class="state" id="updated"></span>
+  </div>
+  <div class="numbers">
+    <div class="panel number"><b id="count">?</b><span id="label">clients online</span></div>
+    <div class="panel number"><b id="intros">?</b><span id="intros-label">pairings in the last hour</span></div>
+  </div>
+  <div class="charts" id="charts"></div>
+  <noscript>This page needs JavaScript to read status.json and history.json.</noscript>
+</main>
+<!-- sites-footer (tools/sync-snippets.sh) -->
+<footer class="sites-foot">
+  <div class="wrap sites-foot-row">
+    <p>piccolo is free software (MIT), part of the <a href="https://github.com/multitap-org">Multitap</a> project.</p>
+    <p class="sites-foot-links"><a href="https://get-piccolo.app/">Home</a> <a href="https://get-piccolo.app/play/">Play</a> <a href="https://cores.get-piccolo.app/cores/">Cores</a> <a href="https://releases.get-piccolo.app/">Releases</a> <a href="https://beacon.get-piccolo.app/status/">Status</a> <a href="https://github.com/multitap-org/piccolo">GitHub</a> <a href="https://github.com/multitap-org/piccolo/issues">Issues</a></p>
+  </div>
+</footer>
+<!-- /sites-footer -->
 <script>
 "use strict";
 
-// piccolo's pixel font (src/pixel_font.cpp in piccolo), the characters this
-// page uses: '#' = pixel on. Every glyph is 5x5 and text advances 6 pixels.
-const GLYPHS = {
-  " ": [".....", ".....", ".....", ".....", "....."],
-  "0": [".###.", "#...#", "#.#.#", "#...#", ".###."],
-  "1": ["..#..", ".##..", "..#..", "..#..", "#####"],
-  "2": [".###.", "#...#", "...#.", "..#..", "#####"],
-  "3": ["####.", "....#", "..##.", "....#", "####."],
-  "4": ["#..#.", "#..#.", "#####", "...#.", "...#."],
-  "5": ["#####", "#....", "#####", "....#", "#####"],
-  "6": ["..##.", ".#...", "####.", "#...#", ".###."],
-  "7": ["#####", "....#", "...#.", "..#..", "..#.."],
-  "8": [".###.", "#...#", "#####", "#...#", ".###."],
-  "9": [".###.", "#...#", ".####", "...#.", ".##.."],
-  "A": ["..#..", ".#.#.", "#...#", "#####", "#...#"],
-  "B": ["####.", "#..#.", "####.", "#...#", "####."],
-  "C": [".####", "#....", "#....", "#....", ".####"],
-  "D": ["###..", "#..#.", "#...#", "#..#.", "###.."],
-  "E": ["#####", "#....", "###..", "#....", "#####"],
-  "F": ["#####", "#....", "###..", "#....", "#...."],
-  "G": [".###.", "#....", "#.###", "#...#", ".####"],
-  "H": ["#...#", "#...#", "#####", "#...#", "#...#"],
-  "I": [".###.", "..#..", "..#..", "..#..", ".###."],
-  "J": ["....#", "....#", "....#", "#...#", ".###."],
-  "K": ["#...#", "#..#.", "###..", "#..#.", "#...#"],
-  "L": ["#....", "#....", "#....", "#....", "#####"],
-  "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"],
-  "N": ["#...#", "##..#", "#.#.#", "#..##", "#...#"],
-  "O": [".###.", "#...#", "#...#", "#...#", ".###."],
-  "P": ["####.", "#...#", "#...#", "####.", "#...."],
-  "Q": [".###.", "#...#", "#...#", ".###.", "...##"],
-  "R": ["####.", "#...#", "#...#", "####.", "#...#"],
-  "S": [".###.", "#....", ".###.", "....#", ".###."],
-  "T": ["#####", "..#..", "..#..", "..#..", "..#.."],
-  "U": ["#...#", "#...#", "#...#", "#...#", ".###."],
-  "V": ["#...#", "#...#", "#...#", ".#.#.", "..#.."],
-  "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"],
-  "X": ["#...#", ".#.#.", "..#..", ".#.#.", "#...#"],
-  "Y": ["#...#", ".#.#.", "..#..", "..#..", "..#.."],
-  "Z": ["#####", "...#.", "..#..", ".#...", "#####"],
-  ".": [".....", ".....", ".....", ".....", "..#.."],
-  ":": [".....", "..#..", ".....", "..#..", "....."],
-  "-": [".....", ".....", ".###.", ".....", "....."],
-  "?": ["####.", "....#", "..##.", ".....", "..#.."],
-};
-// Characters without a glyph draw as a hollow box, as in piccolo.
-const BOX = ["#####", "#...#", "#...#", "#...#", "#####"];
 const SVG = "http://www.w3.org/2000/svg";
 
-// `text` as one SVG: one unit per font pixel, `scale` CSS pixels per unit,
-// with a hard shadow down-right (a quarter of a font pixel on big text, one
-// screen pixel on small text).
-function textSvg(text, scale, colorClass) {
-  const upper = text.toUpperCase();
-  const shadow = Math.max(1, Math.round(scale / 4)) / scale;
-  const width = upper.length * 6;   // the last gap holds the shadow
-  const height = 5 + shadow;
-  const svg = document.createElementNS(SVG, "svg");
-  svg.setAttribute("class", "pixel");
-  svg.setAttribute("viewBox", "0 0 " + width + " " + height);
-  svg.setAttribute("width", String(width * scale));
-  svg.setAttribute("height", String(height * scale));
-  svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", text);
-  const layers = [["shadow", shadow], [colorClass, 0]];
-  for (const [layerClass, offset] of layers) {
-    const group = document.createElementNS(SVG, "g");
-    group.setAttribute("class", layerClass);
-    for (let i = 0; i < upper.length; i++) {
-      const rows = GLYPHS[upper[i]] || BOX;
-      for (let y = 0; y < 5; y++) {
-        for (let x = 0; x < 5; x++) {
-          if (rows[y][x] !== "#") {
-            continue;
-          }
-          const pixel = document.createElementNS(SVG, "rect");
-          pixel.setAttribute("x", String(i * 6 + x + offset));
-          pixel.setAttribute("y", String(y + offset));
-          pixel.setAttribute("width", "1");
-          pixel.setAttribute("height", "1");
-          group.appendChild(pixel);
-        }
-      }
-    }
-    svg.appendChild(group);
-  }
-  return svg;
+// `text` as a <span> with a color class ("text", "dim"), for the chart heads
+// and the tooltip.
+function textSpan(text, colorClass) {
+  const span = document.createElement("span");
+  span.className = colorClass;
+  span.textContent = text;
+  return span;
 }
 
-// Draws `text` into the element with id `id`.
-function drawText(id, text, scale, colorClass) {
-  document.getElementById(id).replaceChildren(textSvg(text, scale, colorClass));
+// `text` into the element with id `id`.
+function drawText(id, text) {
+  document.getElementById(id).textContent = text;
 }
 
-// The same font as a <g> of rectangles inside another SVG, top-left at (x, y),
-// `scale` user units per font pixel. `align` is "start", "middle" or "end".
-function pixelGroup(text, x, y, scale, colorClass, align) {
-  const upper = text.toUpperCase();
-  const width = (upper.length * 6 - 1) * scale;
-  let left = x;
-  if (align === "middle") {
-    left = x - width / 2;
-  } else if (align === "end") {
-    left = x - width;
-  }
-  left = Math.round(left);
-  const group = document.createElementNS(SVG, "g");
-  group.setAttribute("class", colorClass);
-  group.setAttribute("shape-rendering", "crispEdges");
-  for (let i = 0; i < upper.length; i++) {
-    const rows = GLYPHS[upper[i]] || BOX;
-    for (let row = 0; row < 5; row++) {
-      for (let col = 0; col < 5; col++) {
-        if (rows[row][col] !== "#") {
-          continue;
-        }
-        const pixel = document.createElementNS(SVG, "rect");
-        pixel.setAttribute("x", String(left + (i * 6 + col) * scale));
-        pixel.setAttribute("y", String(Math.round(y) + row * scale));
-        pixel.setAttribute("width", String(scale));
-        pixel.setAttribute("height", String(scale));
-        group.appendChild(pixel);
-      }
-    }
-  }
-  return group;
+// An axis label inside a chart's SVG, its top at y. `align` is "start",
+// "middle" or "end".
+function axisText(text, x, y, align) {
+  const label = document.createElementNS(SVG, "text");
+  label.setAttribute("class", "axis");
+  label.setAttribute("x", String(x));
+  label.setAttribute("y", String(Math.round(y) + 10));
+  label.setAttribute("text-anchor", align);
+  label.textContent = text;
+  return label;
 }
 
 // --- History charts (history.json) -----------------------------------------
@@ -322,8 +241,8 @@ function drawChart(section, info, data, now) {
   const titleBox = document.createElement("div");
   const sumBox = document.createElement("div");
   head.append(titleBox, sumBox);
-  titleBox.appendChild(textSvg(info.title, 3, "text"));
-  sumBox.appendChild(textSvg("peak " + peak + "   " + pairings + (pairings === 1 ? " pairing" : " pairings"), 2, "dim"));
+  titleBox.appendChild(textSpan(info.title, "title"));
+  sumBox.appendChild(textSpan("peak " + peak + " · " + pairings + (pairings === 1 ? " pairing" : " pairings"), "dim"));
 
   const width = Math.max(300, Math.min(760, Math.round(plotBox.clientWidth || 760)));
   const height = width < 480 ? 150 : 190;
@@ -355,7 +274,7 @@ function drawChart(section, info, data, now) {
     line.setAttribute("y2", String(gy));
     svg.appendChild(line);
     if (i % 2 === 0) {
-      svg.appendChild(pixelGroup(String(v), left - 8, gy - 5, 2, "dim", "end"));
+      svg.appendChild(axisText(String(v), left - 8, gy - 6, "end"));
     }
   }
   // X ticks.
@@ -371,9 +290,9 @@ function drawChart(section, info, data, now) {
     line.setAttribute("y2", String(top + plotH + 4));
     svg.appendChild(line);
     // Skip labels that would touch the previous one (narrow screens).
-    const labelWidth = (label.length * 6 - 1) * 2;
+    const labelWidth = label.length * 7;
     if (tx - labelWidth / 2 > lastLabelRight + 8 && tx + labelWidth / 2 <= width) {
-      svg.appendChild(pixelGroup(label, tx, top + plotH + 9, 2, "dim", "middle"));
+      svg.appendChild(axisText(label, tx, top + plotH + 7, "middle"));
       lastLabelRight = tx + labelWidth / 2;
     }
   }
@@ -468,7 +387,7 @@ function drawChart(section, info, data, now) {
     tooltip.replaceChildren();
     for (let i = 0; i < lines.length; i++) {
       if (lines[i] !== "") {
-        tooltip.appendChild(textSvg(lines[i], 2, i === 0 ? "dim" : "text"));
+        tooltip.appendChild(textSpan(lines[i], i === 0 ? "dim" : "text"));
       }
     }
     tooltip.style.display = "flex";
@@ -502,7 +421,7 @@ function showHistory() {
     box.replaceChildren();
     for (const info of TIERS) {
       const section = document.createElement("section");
-      section.className = "chart";
+      section.className = "panel chart";
       section.dataset.key = info.key;
       const head = document.createElement("div");
       head.className = "chart-head";
@@ -554,18 +473,21 @@ function show() {
   const now = Date.now() / 1000;
   const fresh = lastStatus !== null && now - lastStatus.updated < STALE_SECONDS;
   if (!fresh) {
-    drawText("count", "?", 16, "accent");
-    drawText("label", "beacon is not answering", 4, "text");
-    drawText("intros", "", 3, "dim");
-    drawText("updated", lastStatus === null ? "no status yet" : "last update " + ago(now - lastStatus.updated), 3, "dim");
+    drawText("count", "?");
+    drawText("label", "beacon is not answering");
+    drawText("intros", "?");
+    drawText("updated", lastStatus === null ? "no status yet" : "down · last update " + ago(now - lastStatus.updated));
+    document.getElementById("updated").classList.add("down");
     return;
   }
   const hosts = lastStatus.hosts_online;
-  drawText("count", String(hosts), 16, "accent");
-  drawText("label", hosts === 1 ? "client online" : "clients online", 4, "text");
+  drawText("count", String(hosts));
+  drawText("label", hosts === 1 ? "client online" : "clients online");
   const intros = lastStatus.introductions_last_hour;
-  drawText("intros", intros + (intros === 1 ? " pairing" : " pairings") + " in the last hour", 3, "dim");
-  drawText("updated", "updated " + ago(now - lastStatus.updated), 3, "dim");
+  drawText("intros", String(intros));
+  drawText("intros-label", intros === 1 ? "pairing in the last hour" : "pairings in the last hour");
+  drawText("updated", "up · updated " + ago(now - lastStatus.updated));
+  document.getElementById("updated").classList.remove("down");
 }
 
 function ago(seconds) {

@@ -175,8 +175,19 @@ show as gaps.
 host registered over IPv4 and IPv6 counts once, two piccolos behind one public
 IP count twice. The page reads `status.json` next to itself every 30 seconds
 and says the beacon isn't answering when the file is older than a minute. Any
-web server that serves `index.html`, `piccolo-logo-dark.svg`, the status
-file and `history.json` from one directory works.
+web server that serves `index.html`, `_site/`, the status file and
+`history.json` from one directory works.
+
+The page has the look all piccolo websites share (the sites bar, the footer,
+Fredoka + IBM Plex Mono; piccolo-site's `assets/README.md`) from its own copy,
+`packaging/status/_site/v1/`, so it stands on its own: it loads nothing from
+another server. The Docker image's entrypoint (`packaging/status-page.sh`)
+copies `index.html` and `_site/` into `/status` (`BEACON_STATUS_DIR`) at every
+start, so the page always matches the image. The copy follows get-piccolo.app:
+the Site look workflow compares it with `https://get-piccolo.app/assets/v1/`
+every day and opens a pull request when the site changed (by hand:
+`tools/fetch-site-assets.sh packaging/status/_site/v1` and
+`tools/sync-snippets.sh packaging/status/_site/v1 packaging/status/index.html`).
 
 **systemd + Caddy.** `systemctl edit beacon`:
 
@@ -195,7 +206,7 @@ keep them. To keep them across reboots, give beacon a fixed user instead of
 `--status-file /var/lib/beacon/status.json`: with `DynamicUser` the state
 directory sits under `/var/lib/private`, which Caddy can't read.)
 
-and in the Caddyfile (the page copied to `/srv/beacon-status`):
+and in the Caddyfile (`index.html` and `_site/` copied to `/srv/beacon-status`):
 
 ```
 beacon.example.org {
@@ -212,9 +223,9 @@ beacon.example.org {
 }
 ```
 
-**Docker (Nginx Proxy Manager or any proxy).** beacon writes into a volume,
-a small nginx container serves it with the page, and the proxy points a host
-name at that container:
+**Docker (Nginx Proxy Manager or any proxy).** beacon writes into a volume
+(and its entrypoint puts the page there), a small nginx container serves it,
+and the proxy points a host name at that container:
 
 ```yaml
 services:
@@ -230,8 +241,6 @@ services:
     restart: unless-stopped
     volumes:
       - beacon-status:/usr/share/nginx/html:ro
-      - ./multitap-beacon/packaging/status/index.html:/usr/share/nginx/html/index.html:ro
-      - ./multitap-beacon/packaging/status/piccolo-logo-dark.svg:/usr/share/nginx/html/piccolo-logo-dark.svg:ro
 volumes:
   beacon-status:
 ```
@@ -386,5 +395,5 @@ WebSocket handshake's SHA-1 is written here from RFC 3174.
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). `packaging/status/piccolo-logo-dark.svg` is piccolo's
+MIT, see [`LICENSE`](LICENSE). `packaging/status/_site/` is piccolo's shared site look (its fonts are OFL: `_site/v1/fonts/OFL-*.txt`); the logo in it is piccolo's
 logo, the Multitap project's own branding.
