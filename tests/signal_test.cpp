@@ -706,10 +706,181 @@ static void test_slow_reader()
     harness_close(&h);
 }
 
+static std::string guest_signal(uint8_t room, uint8_t guest, const std::string& blob)
+{
+    BeaconSignalingMessage m;
+    m.type = BeaconSignalingType::GUEST_SIGNAL;
+    m.room = room_id(room);
+    m.guest = guest;
+    m.blob = reinterpret_cast<const uint8_t*>(blob.data());
+    m.blob_size = static_cast<uint32_t>(blob.size());
+    return client_frame(0x82, encode(&m));
+}
+
+static bool expect_guest(Harness* h, int fd, BeaconSignalingType type, uint8_t room, uint8_t guest)
+{
+    BeaconSignalingMessage m;
+    std::string raw;
+    BeaconId id = room_id(room);
+    return read_message(h, fd, &m, &raw) && m.type == type && beacon_id_equal(&m.room, &id) && m.guest == guest;
+}
+
+static bool expect_refused(Harness* h, int fd, uint8_t room, BeaconRefusal reason)
+{
+    BeaconSignalingMessage m;
+    std::string raw;
+    BeaconId id = room_id(room);
+    return read_message(h, fd, &m, &raw) && m.type == BeaconSignalingType::REFUSED && beacon_id_equal(&m.room, &id) &&
+           m.reason == reason;
+}
+
+static void test_guest_rooms()
+{
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.message_burst = 200;
+    config.max_connections_per_source = 32;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int host = client_open(&h);
+
+    // A guest can't open a guest room: the host makes it.
+    int early = client_open(&h);
+    client_send(&h, early, join(5, BeaconRole::GUEST));
+    check(expect(&h, early, BeaconSignalingType::NOT_FOUND, 5), "a guest before the host: NOT_FOUND");
+    check(h.signal.stats.rooms == 0, "a guest makes no room");
+    BeaconId room5 = room_id(5);
+    check(!beacon_signal_guest_room_live(&h.signal, &room5), "no live guest room yet");
+
+    client_send(&h, host, join(5, BeaconRole::GUEST_HOST));
+    check(expect_joined(&h, host, 5, 0), "the guest host joins");
+    check(beacon_signal_guest_room_live(&h.signal, &room5), "the guest room is live");
+
+    // Eight guests, each with its own index; the ninth is refused.
+    int guests[BEACON_SIGNALING_MAX_GUESTS] = {};
+    for (uint32_t i = 0; i < BEACON_SIGNALING_MAX_GUESTS; i++)
+    {
+        guests[i] = client_open(&h);
+        client_send(&h, guests[i], join(5, BeaconRole::GUEST));
+        check(expect_joined(&h, guests[i], 5, 1), "a guest joins: the host is there");
+        check(expect_guest(&h, host, BeaconSignalingType::GUEST_JOINED, 5, static_cast<uint8_t>(i)),
+              "the host hears GUEST_JOINED with the guest's index");
+    }
+    client_send(&h, early, join(5, BeaconRole::GUEST));
+    check(expect_refused(&h, early, 5, BeaconRefusal::GUESTS_FULL), "the ninth guest: GUESTS_FULL");
+
+    // A guest's SIGNAL reaches the host with its index, and back.
+    client_send(&h, guests[2], client_frame(0x82, signal_message(5, "offer from guest 2")));
+    BeaconSignalingMessage m;
+    std::string raw;
+    check(read_message(&h, host, &m, &raw) && m.type == BeaconSignalingType::GUEST_SIGNAL && m.guest == 2 &&
+              std::string(reinterpret_cast<const char*>(m.blob), m.blob_size) == "offer from guest 2",
+          "the host gets GUEST_SIGNAL from guest 2");
+    check(client_quiet(&h, guests[1]), "the other guests hear nothing");
+    std::string big(BEACON_SIGNALING_MAX_GUEST_BLOB, 'b');
+    client_send(&h, host, guest_signal(5, 2, big));
+    check(read_message(&h, guests[2], &m, &raw) && m.type == BeaconSignalingType::SIGNAL &&
+              std::string(reinterpret_cast<const char*>(m.blob), m.blob_size) == big,
+          "guest 2 gets the host's largest GUEST_SIGNAL as SIGNAL");
+    client_send(&h, guests[4], client_frame(0x82, signal_message(5, std::string(BEACON_SIGNALING_MAX_GUEST_BLOB, 'c'))));
+    check(read_message(&h, host, &m, &raw) && m.guest == 4 && m.blob_size == BEACON_SIGNALING_MAX_GUEST_BLOB,
+          "a guest's 4092-byte blob fits");
+
+    // A guest that leaves: the host hears GUEST_LEFT, and a signal to it too.
+    close(guests[3]);
+    check(expect_guest(&h, host, BeaconSignalingType::GUEST_LEFT, 5, 3), "the host hears GUEST_LEFT 3");
+    client_send(&h, host, guest_signal(5, 3, "late"));
+    check(expect_guest(&h, host, BeaconSignalingType::GUEST_LEFT, 5, 3), "a signal to a gone guest: GUEST_LEFT");
+    client_send(&h, early, join(5, BeaconRole::GUEST));
+    check(expect_joined(&h, early, 5, 1), "a freed index takes a new guest");
+    check(expect_guest(&h, host, BeaconSignalingType::GUEST_JOINED, 5, 3), "it gets index 3");
+    guests[3] = early;
+
+    // Plain roles on a guest room and guest roles on a plain room are refused.
+    int other = client_open(&h);
+    client_send(&h, other, join(5, BeaconRole::CLIENT));
+    check(expect_refused(&h, other, 5, BeaconRefusal::ROOM_KIND), "CLIENT on a guest room: ROOM_KIND");
+    client_send(&h, other, join(6, BeaconRole::HOST));
+    check(expect_joined(&h, other, 6, 0), "a plain room");
+    client_send(&h, guests[0], join(6, BeaconRole::GUEST));
+    check(expect_refused(&h, guests[0], 6, BeaconRefusal::ROOM_KIND), "GUEST on a plain room: ROOM_KIND");
+    client_send(&h, guests[0], join(6, BeaconRole::GUEST_HOST));
+    check(expect_refused(&h, guests[0], 6, BeaconRefusal::ROOM_KIND), "GUEST_HOST on a plain room: ROOM_KIND");
+
+    // The host's SIGNAL (no index) in its guest room is a mistake: NOT_FOUND.
+    client_send(&h, host, client_frame(0x82, signal_message(5, "who?")));
+    check(expect(&h, host, BeaconSignalingType::NOT_FOUND, 5), "the host's plain SIGNAL: NOT_FOUND");
+
+    // The host leaving ends the room: every guest gets LEFT.
+    client_send(&h, host, leave(5));
+    for (uint32_t i = 0; i < BEACON_SIGNALING_MAX_GUESTS; i++)
+    {
+        check(expect(&h, guests[i], BeaconSignalingType::LEFT, 5), "a guest gets LEFT when the host leaves");
+    }
+    check(!beacon_signal_guest_room_live(&h.signal, &room5), "the guest room is gone");
+    check(h.signal.stats.rooms == 1, "only the plain room is left");
+    client_send(&h, guests[0], client_frame(0x82, signal_message(5, "anyone?")));
+    check(expect(&h, guests[0], BeaconSignalingType::NOT_FOUND, 5), "a guest left behind: NOT_FOUND");
+
+    // A guest SIGNAL too big to carry the index closes that guest.
+    client_send(&h, host, join(7, BeaconRole::GUEST_HOST));
+    check(expect_joined(&h, host, 7, 0), "another guest room");
+    client_send(&h, guests[1], join(7, BeaconRole::GUEST));
+    check(expect_joined(&h, guests[1], 7, 1), "a guest joins it");
+    check(expect_guest(&h, host, BeaconSignalingType::GUEST_JOINED, 7, 0), "index 0");
+    client_send(&h, guests[1], client_frame(0x82, signal_message(7, std::string(BEACON_SIGNALING_MAX_BLOB, 'x'))));
+    check(client_sees_eof(&h, guests[1]), "a guest's 4096-byte blob closes it");
+    check(expect_guest(&h, host, BeaconSignalingType::GUEST_LEFT, 7, 0), "the host hears it left");
+
+    for (uint32_t i = 0; i < BEACON_SIGNALING_MAX_GUESTS; i++)
+    {
+        close(guests[i]);
+    }
+    close(other);
+    close(host);
+    harness_close(&h);
+}
+
+static void test_guest_rate()
+{
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.message_burst = 200;
+    config.max_connections_per_source = 32;
+    check(harness_open(&h, &config), "signaling listener opens");
+    int host = client_open(&h);
+    for (uint8_t room = 10; room < 17; room++)
+    {
+        client_send(&h, host, join(room, BeaconRole::GUEST_HOST));
+        check(expect_joined(&h, host, room, 0), "a guest room");
+    }
+    // Burst 5: the sixth guest JOIN from one socket is refused; a minute later
+    // ten more are allowed (10 a minute, up to the burst).
+    int guest = client_open(&h);
+    for (uint8_t room = 10; room < 15; room++)
+    {
+        client_send(&h, guest, join(room, BeaconRole::GUEST));
+        check(expect_joined(&h, guest, room, 1), "a guest JOIN within the burst");
+    }
+    client_send(&h, guest, join(15, BeaconRole::GUEST));
+    check(expect_refused(&h, guest, 15, BeaconRefusal::GUEST_RATE), "the sixth guest JOIN: GUEST_RATE");
+    client_send(&h, guest, join(10, BeaconRole::GUEST));
+    check(expect_joined(&h, guest, 10, 1), "a refresh of a room it's in isn't counted");
+    h.now += 6000;
+    client_send(&h, guest, join(15, BeaconRole::GUEST));
+    check(expect_joined(&h, guest, 15, 1), "six seconds later: one more");
+    client_send(&h, guest, join(16, BeaconRole::GUEST));
+    check(expect_refused(&h, guest, 16, BeaconRefusal::GUEST_RATE), "and not two");
+    close(guest);
+    close(host);
+    harness_close(&h);
+}
+
 int main()
 {
     test_websocket_basics();
     test_rooms();
+    test_guest_rooms();
+    test_guest_rate();
     test_rate_limits();
     test_sources();
     test_slow_reader();

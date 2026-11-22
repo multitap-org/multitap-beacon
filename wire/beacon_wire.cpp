@@ -422,9 +422,23 @@ static uint32_t signaling_fixed_size(uint8_t type)
         case static_cast<uint8_t>(BeaconSignalingType::LEFT):
         case static_cast<uint8_t>(BeaconSignalingType::NOT_FOUND):
             return BEACON_SIGNALING_SIZE_ROOM;
+        case static_cast<uint8_t>(BeaconSignalingType::GUEST_JOINED):
+        case static_cast<uint8_t>(BeaconSignalingType::GUEST_LEFT):
+            return BEACON_SIGNALING_SIZE_GUEST;
         default:
-            return 0;   // SIGNAL (variable) or not a signaling type
+            return 0;   // SIGNAL, GUEST_SIGNAL (variable) or not a signaling type
     }
+}
+
+static bool valid_role(uint8_t role)
+{
+    return role >= static_cast<uint8_t>(BeaconRole::HOST) && role <= static_cast<uint8_t>(BeaconRole::GUEST);
+}
+
+static bool valid_refusal(uint8_t reason)
+{
+    return reason >= static_cast<uint8_t>(BeaconRefusal::ROOMS_PER_CONNECTION) &&
+           reason <= static_cast<uint8_t>(BeaconRefusal::GUEST_RATE);
 }
 
 bool beacon_signaling_decode(const uint8_t* data, size_t size, BeaconSignalingMessage* out)
@@ -445,6 +459,15 @@ bool beacon_signaling_decode(const uint8_t* data, size_t size, BeaconSignalingMe
         out->blob = data + BEACON_SIGNALING_SIGNAL_HEADER;
         out->blob_size = static_cast<uint32_t>(size - BEACON_SIGNALING_SIGNAL_HEADER);
     }
+    else if (type == static_cast<uint8_t>(BeaconSignalingType::GUEST_SIGNAL))
+    {
+        if (size <= BEACON_SIGNALING_GUEST_SIGNAL_HEADER || size > BEACON_SIGNALING_MAX_SIZE)
+        {
+            return false;
+        }
+        out->blob = data + BEACON_SIGNALING_GUEST_SIGNAL_HEADER;
+        out->blob_size = static_cast<uint32_t>(size - BEACON_SIGNALING_GUEST_SIGNAL_HEADER);
+    }
     else
     {
         uint32_t expected = signaling_fixed_size(type);
@@ -462,8 +485,7 @@ bool beacon_signaling_decode(const uint8_t* data, size_t size, BeaconSignalingMe
     switch (out->type)
     {
         case BeaconSignalingType::JOIN:
-            if (data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRole::HOST) &&
-                data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRole::CLIENT))
+            if (!valid_role(data[OFFSET_ROOM_END]))
             {
                 return false;
             }
@@ -477,12 +499,20 @@ bool beacon_signaling_decode(const uint8_t* data, size_t size, BeaconSignalingMe
             out->peer_present = data[OFFSET_ROOM_END];
             return all_zero(data + OFFSET_ROOM_PAD, 3);
         case BeaconSignalingType::REFUSED:
-            if (data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRefusal::ROOMS_PER_CONNECTION) &&
-                data[OFFSET_ROOM_END] != static_cast<uint8_t>(BeaconRefusal::ROOMS_FULL))
+            if (!valid_refusal(data[OFFSET_ROOM_END]))
             {
                 return false;
             }
             out->reason = static_cast<BeaconRefusal>(data[OFFSET_ROOM_END]);
+            return all_zero(data + OFFSET_ROOM_PAD, 3);
+        case BeaconSignalingType::GUEST_JOINED:
+        case BeaconSignalingType::GUEST_LEFT:
+        case BeaconSignalingType::GUEST_SIGNAL:
+            if (data[OFFSET_ROOM_END] >= BEACON_SIGNALING_MAX_GUESTS)
+            {
+                return false;
+            }
+            out->guest = data[OFFSET_ROOM_END];
             return all_zero(data + OFFSET_ROOM_PAD, 3);
         default:
             return true;
@@ -501,6 +531,14 @@ uint32_t beacon_signaling_encode(const BeaconSignalingMessage* message, uint8_t*
         }
         size = BEACON_SIGNALING_SIGNAL_HEADER + message->blob_size;
     }
+    else if (message->type == BeaconSignalingType::GUEST_SIGNAL)
+    {
+        if (message->blob == nullptr || message->blob_size < 1 || message->blob_size > BEACON_SIGNALING_MAX_GUEST_BLOB)
+        {
+            return 0;
+        }
+        size = BEACON_SIGNALING_GUEST_SIGNAL_HEADER + message->blob_size;
+    }
     else
     {
         size = signaling_fixed_size(type);
@@ -512,7 +550,7 @@ uint32_t beacon_signaling_encode(const BeaconSignalingMessage* message, uint8_t*
     switch (message->type)
     {
         case BeaconSignalingType::JOIN:
-            if (message->role != BeaconRole::HOST && message->role != BeaconRole::CLIENT)
+            if (!valid_role(static_cast<uint8_t>(message->role)))
             {
                 return 0;
             }
@@ -524,7 +562,15 @@ uint32_t beacon_signaling_encode(const BeaconSignalingMessage* message, uint8_t*
             }
             break;
         case BeaconSignalingType::REFUSED:
-            if (message->reason != BeaconRefusal::ROOMS_PER_CONNECTION && message->reason != BeaconRefusal::ROOMS_FULL)
+            if (!valid_refusal(static_cast<uint8_t>(message->reason)))
+            {
+                return 0;
+            }
+            break;
+        case BeaconSignalingType::GUEST_JOINED:
+        case BeaconSignalingType::GUEST_LEFT:
+        case BeaconSignalingType::GUEST_SIGNAL:
+            if (message->guest >= BEACON_SIGNALING_MAX_GUESTS)
             {
                 return 0;
             }
@@ -550,6 +596,14 @@ uint32_t beacon_signaling_encode(const BeaconSignalingMessage* message, uint8_t*
             break;
         case BeaconSignalingType::SIGNAL:
             memcpy(out + BEACON_SIGNALING_SIGNAL_HEADER, message->blob, message->blob_size);
+            break;
+        case BeaconSignalingType::GUEST_JOINED:
+        case BeaconSignalingType::GUEST_LEFT:
+            out[OFFSET_ROOM_END] = message->guest;
+            break;
+        case BeaconSignalingType::GUEST_SIGNAL:
+            out[OFFSET_ROOM_END] = message->guest;
+            memcpy(out + BEACON_SIGNALING_GUEST_SIGNAL_HEADER, message->blob, message->blob_size);
             break;
         default:
             break;

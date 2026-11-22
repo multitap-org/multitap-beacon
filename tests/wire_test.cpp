@@ -396,8 +396,34 @@ static void test_signaling()
     m.reason = BeaconRefusal::ROOMS_FULL;
     size = beacon_signaling_encode(&m, out, sizeof(out));
     check(size == 28 && beacon_signaling_decode(out, size, &d) && d.reason == BeaconRefusal::ROOMS_FULL, "REFUSED");
-    out[24] = 3;
+    out[24] = 6;
     check(!beacon_signaling_decode(out, size, &d), "an unknown refusal reason is refused");
+    out[24] = 0;
+    check(!beacon_signaling_decode(out, size, &d), "refusal reason 0 is refused");
+    m.reason = BeaconRefusal::GUEST_RATE;
+    size = beacon_signaling_encode(&m, out, sizeof(out));
+    check(size == 28 && out[24] == 5 && beacon_signaling_decode(out, size, &d) && d.reason == BeaconRefusal::GUEST_RATE,
+          "REFUSED GUEST_RATE");
+
+    // Guest rooms: GUEST_JOINED / GUEST_LEFT carry the guest's index.
+    const BeaconSignalingType guest_types[] = {BeaconSignalingType::GUEST_JOINED, BeaconSignalingType::GUEST_LEFT};
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        m.type = guest_types[i];
+        m.guest = 7;
+        size = beacon_signaling_encode(&m, out, sizeof(out));
+        check(size == BEACON_SIGNALING_SIZE_GUEST && out[5] == 24 + i && out[24] == 7 &&
+                  beacon_signaling_decode(out, size, &d) && d.type == guest_types[i] && d.guest == 7,
+              "GUEST_JOINED / GUEST_LEFT round trip");
+        out[24] = BEACON_SIGNALING_MAX_GUESTS;
+        check(!beacon_signaling_decode(out, size, &d), "a guest index past the last is refused");
+        out[24] = 7;
+        out[26] = 1;
+        check(!beacon_signaling_decode(out, size, &d), "guest padding must be zero");
+        m.guest = BEACON_SIGNALING_MAX_GUESTS;
+        check(beacon_signaling_encode(&m, out, sizeof(out)) == 0, "a guest index past the last doesn't encode");
+    }
+    m.guest = 0;
 
     // SIGNAL: 1-4096 opaque bytes, the length from the message.
     uint8_t blob[BEACON_SIGNALING_MAX_BLOB + 1];
@@ -427,6 +453,29 @@ static void test_signaling()
     memset(out + size, 0, BEACON_SIGNALING_MAX_SIZE + 1 - size);
     check(!beacon_signaling_decode(out, BEACON_SIGNALING_MAX_SIZE + 1, &d), "SIGNAL over the limit is refused");
 
+    // GUEST_SIGNAL: index, three zero bytes, then 1-4092 bytes (it fits one frame).
+    m.type = BeaconSignalingType::GUEST_SIGNAL;
+    m.guest = 3;
+    const uint32_t guest_blob_sizes[] = {1, 100, BEACON_SIGNALING_MAX_GUEST_BLOB};
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        m.blob_size = guest_blob_sizes[i];
+        size = beacon_signaling_encode(&m, out, sizeof(out));
+        check(size == 28 + guest_blob_sizes[i] && out[24] == 3 && beacon_signaling_decode(out, size, &d) &&
+                  d.guest == 3 && d.blob_size == guest_blob_sizes[i] && d.blob == out + 28 &&
+                  memcmp(d.blob, blob, d.blob_size) == 0,
+              "GUEST_SIGNAL round trip");
+    }
+    check(size == BEACON_SIGNALING_MAX_SIZE, "the largest GUEST_SIGNAL is the largest SIGNAL");
+    m.blob_size = BEACON_SIGNALING_MAX_GUEST_BLOB + 1;
+    check(beacon_signaling_encode(&m, out, sizeof(out)) == 0, "a GUEST_SIGNAL blob over 4092 doesn't encode");
+    m.blob_size = 10;
+    size = beacon_signaling_encode(&m, out, sizeof(out));
+    check(!beacon_signaling_decode(out, 28, &d), "GUEST_SIGNAL without a blob is refused");
+    out[25] = 1;
+    check(!beacon_signaling_decode(out, size, &d), "GUEST_SIGNAL padding must be zero");
+    m.guest = 0;
+
     // Header and field rules.
     m.type = BeaconSignalingType::JOIN;
     m.role = BeaconRole::HOST;
@@ -440,8 +489,12 @@ static void test_signaling()
         check(!beacon_signaling_decode(bad, 28, &d), "a JOIN with a bad header or padding byte is refused");
     }
     memcpy(bad, out, 28);
-    bad[24] = 3;
-    check(!beacon_signaling_decode(bad, 28, &d), "a JOIN with role 3 is refused");
+    bad[24] = 5;
+    check(!beacon_signaling_decode(bad, 28, &d), "a JOIN with role 5 is refused");
+    bad[24] = 0;
+    check(!beacon_signaling_decode(bad, 28, &d), "a JOIN with role 0 is refused");
+    bad[24] = 4;
+    check(beacon_signaling_decode(bad, 28, &d) && d.role == BeaconRole::GUEST, "a JOIN with role 4 is a guest");
     memcpy(bad, out, 28);
     memset(bad + 8, 0, 16);
     check(!beacon_signaling_decode(bad, 28, &d), "a zero room is refused");

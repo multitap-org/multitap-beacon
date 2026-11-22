@@ -9,6 +9,12 @@
 // SIGNAL passes a message to the other side as is, LEAVE or closing takes the
 // socket out. beacon never reads a SIGNAL's blob.
 //
+// Guest rooms (guest links): one host (role GUEST_HOST) and up to
+// BEACON_SIGNALING_MAX_GUESTS guests (role GUEST), each with an index. The
+// host must be there first; a guest's SIGNAL reaches the host as GUEST_SIGNAL
+// with the guest's index, the host's GUEST_SIGNAL reaches that guest as
+// SIGNAL. The host leaving ends the room: every guest gets LEFT.
+//
 // Memory, all allocated by beacon_signal_open() and never grown:
 // - a pool of max_connections connections, each with fixed receive and send
 //   buffers and its list of rooms. A connection whose send buffer would
@@ -69,6 +75,8 @@ struct BeaconSignalConfig
     uint32_t message_burst = 60;
     uint32_t bytes_per_second = 16384;      // per connection: their payload bytes
     uint32_t byte_burst = 65536;
+    uint32_t guest_joins_per_minute = 10;   // per connection: JOINs as a guest
+    uint32_t guest_join_burst = 5;
     // Proxies whose X-Forwarded-For is believed (loopback always is).
     BeaconCidr trusted[BEACON_SIGNAL_MAX_TRUSTED] = {};
     uint32_t trusted_count = 0;
@@ -96,6 +104,8 @@ struct BeaconConnection
     uint64_t message_tokens_milli = 0;
     uint64_t bytes_last_ms = 0;
     uint64_t byte_tokens_milli = 0;
+    uint64_t guest_joins_last_ms = 0;
+    uint64_t guest_join_tokens_milli = 0;
     uint32_t room_count = 0;
     uint32_t rooms[BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION] = {};   // room table slots
     uint32_t receive_used = 0;
@@ -108,8 +118,12 @@ struct BeaconRoom
 {
     BeaconId id = {};
     uint32_t host = BEACON_SIGNAL_NONE;     // connection indexes
-    uint32_t client = BEACON_SIGNAL_NONE;
+    uint32_t client = BEACON_SIGNAL_NONE;   // plain rooms only
+    uint32_t guests[BEACON_SIGNALING_MAX_GUESTS] = {BEACON_SIGNAL_NONE, BEACON_SIGNAL_NONE, BEACON_SIGNAL_NONE,
+                                                    BEACON_SIGNAL_NONE, BEACON_SIGNAL_NONE, BEACON_SIGNAL_NONE,
+                                                    BEACON_SIGNAL_NONE, BEACON_SIGNAL_NONE};
     uint8_t used = 0;
+    uint8_t guest_room = 0;                 // made by a GUEST_HOST JOIN
 };
 
 struct BeaconSignalStats
@@ -124,6 +138,8 @@ struct BeaconSignalStats
     uint64_t refused_rooms = 0;         // JOIN over a room limit
     uint64_t signals = 0;               // SIGNALs passed along
     uint64_t not_found = 0;
+    uint64_t guest_joins = 0;           // guests let into a guest room
+    uint64_t refused_guests = 0;        // guest JOINs refused (full, rate, wrong kind)
     uint64_t rate_limited = 0;          // closed for going over a rate
     uint64_t protocol_errors = 0;       // a frame or message broke a rule
     uint64_t timeouts = 0;              // handshake, idle or closing
@@ -169,6 +185,10 @@ void beacon_signal_event(BeaconSignal* signal, uint32_t index, uint32_t events, 
 
 // Timeouts, about once a second.
 void beacon_signal_tick(BeaconSignal* signal, uint64_t now_ms);
+
+// True if `room` is a guest room whose host is connected (cards live as long
+// as that).
+bool beacon_signal_guest_room_live(const BeaconSignal* signal, const BeaconId* room);
 
 // Clears the counters (not `open` / `rooms`).
 void beacon_signal_stats_reset(BeaconSignal* signal);

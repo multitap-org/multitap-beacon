@@ -227,10 +227,17 @@ static void send_message(BeaconSignal* signal, uint32_t index, BeaconSignalingTy
     BeaconSignalingMessage message;
     message.type = type;
     message.room = *room;
-    message.peer_present = value;
     if (type == BeaconSignalingType::REFUSED)
     {
         message.reason = static_cast<BeaconRefusal>(value);
+    }
+    else if (type == BeaconSignalingType::GUEST_JOINED || type == BeaconSignalingType::GUEST_LEFT)
+    {
+        message.guest = value;
+    }
+    else if (type == BeaconSignalingType::JOINED)
+    {
+        message.peer_present = value;
     }
     uint8_t bytes[BEACON_SIGNALING_SIZE_JOIN];
     uint32_t size = beacon_signaling_encode(&message, bytes, sizeof(bytes));
@@ -312,9 +319,59 @@ static void list_remove(BeaconConnection* connection, uint32_t slot)
 
 // Takes connection `index` off its side of room `slot` (not off its list),
 // tells the other side, and forgets the room if it's empty.
+// A guest room's host is gone: every guest gets LEFT and leaves it, and the
+// room is forgotten.
+static void guest_room_end(BeaconSignal* signal, uint32_t slot, uint64_t now_ms)
+{
+    BeaconRoom* room = &signal->rooms[slot];
+    for (uint32_t i = 0; i < BEACON_SIGNALING_MAX_GUESTS; i++)
+    {
+        uint32_t guest = room->guests[i];
+        if (guest != BEACON_SIGNAL_NONE)
+        {
+            room->guests[i] = BEACON_SIGNAL_NONE;
+            list_remove(&signal->connections[guest], slot);
+            send_message(signal, guest, BeaconSignalingType::LEFT, &room->id, 0, now_ms);
+        }
+    }
+    *room = BeaconRoom{};
+    signal->stats.rooms--;
+}
+
+static uint32_t guest_index_of(const BeaconRoom* room, uint32_t index)
+{
+    for (uint32_t i = 0; i < BEACON_SIGNALING_MAX_GUESTS; i++)
+    {
+        if (room->guests[i] == index)
+        {
+            return i;
+        }
+    }
+    return BEACON_SIGNAL_NONE;
+}
+
 static void room_remove_side(BeaconSignal* signal, uint32_t slot, uint32_t index, uint64_t now_ms)
 {
     BeaconRoom* room = &signal->rooms[slot];
+    if (room->guest_room != 0)
+    {
+        if (room->host == index)
+        {
+            guest_room_end(signal, slot, now_ms);
+            return;
+        }
+        uint32_t guest = guest_index_of(room, index);
+        if (guest != BEACON_SIGNAL_NONE)
+        {
+            room->guests[guest] = BEACON_SIGNAL_NONE;
+            if (room->host != BEACON_SIGNAL_NONE)
+            {
+                send_message(signal, room->host, BeaconSignalingType::GUEST_LEFT, &room->id,
+                             static_cast<uint8_t>(guest), now_ms);
+            }
+        }
+        return;
+    }
     uint32_t other = BEACON_SIGNAL_NONE;
     if (room->host == index)
     {
@@ -458,12 +515,172 @@ static void refuse_handshake(BeaconConnection* connection, const char* response,
 // Messages
 // ---------------------------------------------------------------------------
 
-// JOIN: returns false if the connection was closed for it.
-static bool handle_join(BeaconSignal* signal, uint32_t index, const BeaconSignalingMessage* message, uint64_t now_ms)
+static void refuse_join(BeaconSignal* signal, uint32_t index, const BeaconId* room, BeaconRefusal reason,
+                        uint64_t now_ms)
+{
+    signal->stats.refused_rooms++;
+    send_message(signal, index, BeaconSignalingType::REFUSED, room, static_cast<uint8_t>(reason), now_ms);
+}
+
+// A token bucket counted per minute (bucket_take's rates are per second).
+static bool bucket_take_per_minute(uint64_t* tokens_milli, uint64_t* last_ms, uint64_t now_ms, uint64_t rate,
+                                   uint64_t burst)
+{
+    uint64_t full = burst * MILLI * 60;
+    uint64_t elapsed = now_ms > *last_ms ? now_ms - *last_ms : 0;
+    // Counted in 1/60000 tokens: `rate` per minute = rate per ms in these units.
+    uint64_t tokens = *tokens_milli + elapsed * rate;
+    *tokens_milli = tokens > full ? full : tokens;
+    *last_ms = now_ms;
+    if (*tokens_milli < MILLI * 60)
+    {
+        return false;
+    }
+    *tokens_milli -= MILLI * 60;
+    return true;
+}
+
+// JOIN as a guest room's host: makes the room (or refreshes it). A new host
+// socket replaces the old one, and the guests start over (they get LEFT).
+static bool handle_join_guest_host(BeaconSignal* signal, uint32_t index, const BeaconSignalingMessage* message,
+                                   uint64_t now_ms)
 {
     BeaconConnection* connection = &signal->connections[index];
     uint32_t free_slot = BEACON_SIGNAL_NONE;
     uint32_t slot = room_find(signal, &message->room, &free_slot);
+    if (slot != BEACON_SIGNAL_NONE && signal->rooms[slot].guest_room == 0)
+    {
+        refuse_join(signal, index, &message->room, BeaconRefusal::ROOM_KIND, now_ms);
+        return true;
+    }
+    if (slot != BEACON_SIGNAL_NONE && guest_index_of(&signal->rooms[slot], index) != BEACON_SIGNAL_NONE)
+    {
+        // Host and guest of one room on one socket: a client bug.
+        signal->stats.protocol_errors++;
+        start_closing(signal, index, BEACON_WS_CLOSE_POLICY, now_ms);
+        return false;
+    }
+    if (slot != BEACON_SIGNAL_NONE && signal->rooms[slot].host == index)
+    {
+        signal->stats.joins++;
+        send_message(signal, index, BeaconSignalingType::JOINED, &message->room, 0, now_ms);
+        return true;
+    }
+    if (connection->room_count >= BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION)
+    {
+        refuse_join(signal, index, &message->room, BeaconRefusal::ROOMS_PER_CONNECTION, now_ms);
+        return true;
+    }
+    if (slot != BEACON_SIGNAL_NONE)
+    {
+        // A reconnect before the old socket timed out: the new one wins, and
+        // the guests start over with it.
+        uint32_t old = signal->rooms[slot].host;
+        signal->stats.replaced++;
+        list_remove(&signal->connections[old], slot);
+        send_message(signal, old, BeaconSignalingType::LEFT, &message->room, 0, now_ms);
+        guest_room_end(signal, slot, now_ms);
+        slot = room_find(signal, &message->room, &free_slot);
+    }
+    if (free_slot == BEACON_SIGNAL_NONE || signal->stats.rooms >= signal->config.max_rooms)
+    {
+        refuse_join(signal, index, &message->room, BeaconRefusal::ROOMS_FULL, now_ms);
+        return true;
+    }
+    BeaconRoom* room = &signal->rooms[free_slot];
+    *room = BeaconRoom{};
+    room->id = message->room;
+    room->used = 1;
+    room->guest_room = 1;
+    room->host = index;
+    signal->stats.rooms++;
+    connection->rooms[connection->room_count++] = free_slot;
+    signal->stats.joins++;
+    send_message(signal, index, BeaconSignalingType::JOINED, &message->room, 0, now_ms);
+    return true;
+}
+
+// JOIN as a guest: only into a guest room whose host is there, at most
+// BEACON_SIGNALING_MAX_GUESTS at once, and only so often per socket.
+static bool handle_join_guest(BeaconSignal* signal, uint32_t index, const BeaconSignalingMessage* message,
+                              uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    uint32_t free_slot = BEACON_SIGNAL_NONE;
+    uint32_t slot = room_find(signal, &message->room, &free_slot);
+    if (slot == BEACON_SIGNAL_NONE || signal->rooms[slot].host == BEACON_SIGNAL_NONE)
+    {
+        signal->stats.not_found++;
+        send_message(signal, index, BeaconSignalingType::NOT_FOUND, &message->room, 0, now_ms);
+        return true;
+    }
+    BeaconRoom* room = &signal->rooms[slot];
+    if (room->guest_room == 0)
+    {
+        signal->stats.refused_guests++;
+        refuse_join(signal, index, &message->room, BeaconRefusal::ROOM_KIND, now_ms);
+        return true;
+    }
+    if (room->host == index)
+    {
+        signal->stats.protocol_errors++;
+        start_closing(signal, index, BEACON_WS_CLOSE_POLICY, now_ms);
+        return false;
+    }
+    if (guest_index_of(room, index) != BEACON_SIGNAL_NONE)
+    {
+        signal->stats.joins++;
+        send_message(signal, index, BeaconSignalingType::JOINED, &message->room, 1, now_ms);
+        return true;
+    }
+    if (!bucket_take_per_minute(&connection->guest_join_tokens_milli, &connection->guest_joins_last_ms, now_ms,
+                                signal->config.guest_joins_per_minute, signal->config.guest_join_burst))
+    {
+        signal->stats.refused_guests++;
+        refuse_join(signal, index, &message->room, BeaconRefusal::GUEST_RATE, now_ms);
+        return true;
+    }
+    if (connection->room_count >= BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION)
+    {
+        refuse_join(signal, index, &message->room, BeaconRefusal::ROOMS_PER_CONNECTION, now_ms);
+        return true;
+    }
+    uint32_t guest = guest_index_of(room, BEACON_SIGNAL_NONE);
+    if (guest == BEACON_SIGNAL_NONE)
+    {
+        signal->stats.refused_guests++;
+        refuse_join(signal, index, &message->room, BeaconRefusal::GUESTS_FULL, now_ms);
+        return true;
+    }
+    room->guests[guest] = index;
+    connection->rooms[connection->room_count++] = slot;
+    signal->stats.joins++;
+    signal->stats.guest_joins++;
+    send_message(signal, room->host, BeaconSignalingType::GUEST_JOINED, &room->id, static_cast<uint8_t>(guest),
+                 now_ms);
+    send_message(signal, index, BeaconSignalingType::JOINED, &room->id, 1, now_ms);
+    return true;
+}
+
+// JOIN: returns false if the connection was closed for it.
+static bool handle_join(BeaconSignal* signal, uint32_t index, const BeaconSignalingMessage* message, uint64_t now_ms)
+{
+    if (message->role == BeaconRole::GUEST_HOST)
+    {
+        return handle_join_guest_host(signal, index, message, now_ms);
+    }
+    if (message->role == BeaconRole::GUEST)
+    {
+        return handle_join_guest(signal, index, message, now_ms);
+    }
+    BeaconConnection* connection = &signal->connections[index];
+    uint32_t free_slot = BEACON_SIGNAL_NONE;
+    uint32_t slot = room_find(signal, &message->room, &free_slot);
+    if (slot != BEACON_SIGNAL_NONE && signal->rooms[slot].guest_room != 0)
+    {
+        refuse_join(signal, index, &message->room, BeaconRefusal::ROOM_KIND, now_ms);
+        return true;
+    }
     if (slot == BEACON_SIGNAL_NONE)
     {
         if (connection->room_count >= BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION)
@@ -541,6 +758,95 @@ static void handle_leave(BeaconSignal* signal, uint32_t index, const BeaconSigna
     room_remove_side(signal, slot, index, now_ms);
 }
 
+// Queues a re-encoded message for `target` (OPEN) and turns on its EPOLLOUT;
+// false if it can't take it (then it's doomed).
+static bool forward_message(BeaconSignal* signal, uint32_t target, const BeaconSignalingMessage* message,
+                            uint64_t now_ms)
+{
+    uint8_t bytes[BEACON_SIGNALING_MAX_SIZE];
+    uint32_t size = beacon_signaling_encode(message, bytes, sizeof(bytes));
+    if (size == 0)
+    {
+        return false;
+    }
+    if (!queue_frame(&signal->connections[target], BeaconWsOpcode::BINARY, bytes, size))
+    {
+        doom(signal, target, now_ms);
+        return false;
+    }
+    set_want_write(signal, target, true);
+    return true;
+}
+
+// A guest's SIGNAL in its guest room: to the host as GUEST_SIGNAL, with the
+// guest's index. The host's own SIGNAL here is a mistake (it must say which
+// guest): NOT_FOUND.
+static void handle_guest_signal_up(BeaconSignal* signal, uint32_t index, uint32_t slot,
+                                   const BeaconSignalingMessage* message, uint64_t now_ms)
+{
+    const BeaconRoom* room = &signal->rooms[slot];
+    uint32_t guest = guest_index_of(room, index);
+    uint32_t host = room->host;
+    if (guest == BEACON_SIGNAL_NONE || host == BEACON_SIGNAL_NONE ||
+        signal->connections[host].state != BeaconConnectionState::OPEN)
+    {
+        signal->stats.not_found++;
+        send_message(signal, index, BeaconSignalingType::NOT_FOUND, &message->room, 0, now_ms);
+        return;
+    }
+    if (message->blob_size > BEACON_SIGNALING_MAX_GUEST_BLOB)
+    {
+        // Too big to carry the index: the guest's own limit (PROTOCOL.md).
+        signal->stats.protocol_errors++;
+        start_closing(signal, index, BEACON_WS_CLOSE_TOO_BIG, now_ms);
+        return;
+    }
+    BeaconSignalingMessage up;
+    up.type = BeaconSignalingType::GUEST_SIGNAL;
+    up.room = message->room;
+    up.guest = static_cast<uint8_t>(guest);
+    up.blob = message->blob;
+    up.blob_size = message->blob_size;
+    if (!forward_message(signal, host, &up, now_ms))
+    {
+        signal->stats.not_found++;
+        send_message(signal, index, BeaconSignalingType::NOT_FOUND, &message->room, 0, now_ms);
+        return;
+    }
+    signal->stats.signals++;
+}
+
+// GUEST_SIGNAL from a guest room's host: to that guest as SIGNAL. A guest
+// that's gone gets the host a GUEST_LEFT (NOT_FOUND couldn't say which).
+static void handle_guest_signal_down(BeaconSignal* signal, uint32_t index, const BeaconSignalingMessage* message,
+                                     uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    uint32_t free_slot = BEACON_SIGNAL_NONE;
+    uint32_t slot = room_find(signal, &message->room, &free_slot);
+    if (slot == BEACON_SIGNAL_NONE || !list_has(connection, slot) || signal->rooms[slot].guest_room == 0 ||
+        signal->rooms[slot].host != index)
+    {
+        signal->stats.not_found++;
+        send_message(signal, index, BeaconSignalingType::NOT_FOUND, &message->room, 0, now_ms);
+        return;
+    }
+    uint32_t guest = signal->rooms[slot].guests[message->guest];
+    BeaconSignalingMessage down;
+    down.type = BeaconSignalingType::SIGNAL;
+    down.room = message->room;
+    down.blob = message->blob;
+    down.blob_size = message->blob_size;
+    if (guest == BEACON_SIGNAL_NONE || signal->connections[guest].state != BeaconConnectionState::OPEN ||
+        !forward_message(signal, guest, &down, now_ms))
+    {
+        signal->stats.not_found++;
+        send_message(signal, index, BeaconSignalingType::GUEST_LEFT, &message->room, message->guest, now_ms);
+        return;
+    }
+    signal->stats.signals++;
+}
+
 // SIGNAL: the whole message (`payload`, header included) goes to the other side.
 static void handle_signal(BeaconSignal* signal, uint32_t index, const BeaconSignalingMessage* message,
                           const uint8_t* payload, size_t size, uint64_t now_ms)
@@ -552,6 +858,11 @@ static void handle_signal(BeaconSignal* signal, uint32_t index, const BeaconSign
     if (slot != BEACON_SIGNAL_NONE && list_has(connection, slot))
     {
         const BeaconRoom* room = &signal->rooms[slot];
+        if (room->guest_room != 0)
+        {
+            handle_guest_signal_up(signal, index, slot, message, now_ms);
+            return;
+        }
         other = room->host == index ? room->client : room->host;
     }
     if (other == BEACON_SIGNAL_NONE || signal->connections[other].state != BeaconConnectionState::OPEN)
@@ -595,6 +906,9 @@ static bool handle_message(BeaconSignal* signal, uint32_t index, const uint8_t* 
             break;
         case BeaconSignalingType::SIGNAL:
             handle_signal(signal, index, &message, payload, size, now_ms);
+            break;
+        case BeaconSignalingType::GUEST_SIGNAL:
+            handle_guest_signal_down(signal, index, &message, now_ms);
             break;
         default:
             // A server-only type from a client.
@@ -641,6 +955,8 @@ static void finish_handshake(BeaconSignal* signal, uint32_t index, const BeaconW
     connection->message_tokens_milli = static_cast<uint64_t>(signal->config.message_burst) * MILLI;
     connection->bytes_last_ms = now_ms;
     connection->byte_tokens_milli = static_cast<uint64_t>(signal->config.byte_burst) * MILLI;
+    connection->guest_joins_last_ms = now_ms;
+    connection->guest_join_tokens_milli = static_cast<uint64_t>(signal->config.guest_join_burst) * MILLI * 60;
     connection->room_count = 0;
 }
 
@@ -790,7 +1106,8 @@ bool beacon_signal_open(BeaconSignal* signal, const BeaconSignalConfig* config, 
     if (config->max_connections < 1 || config->max_connections > BEACON_SIGNAL_MAX_CONNECTIONS ||
         config->max_rooms < 1 || config->max_rooms > (1u << 24) || config->max_connections_per_source < 1 ||
         config->messages_per_second < 1 || config->message_burst < 1 || config->bytes_per_second < 1 ||
-        config->byte_burst < BEACON_WS_MAX_PAYLOAD || config->trusted_count > BEACON_SIGNAL_MAX_TRUSTED)
+        config->byte_burst < BEACON_WS_MAX_PAYLOAD || config->trusted_count > BEACON_SIGNAL_MAX_TRUSTED ||
+        config->guest_joins_per_minute < 1 || config->guest_join_burst < 1)
     {
         beacon_log(BeaconLogLevel::error, "signaling: configuration out of range");
         return false;
@@ -1014,6 +1331,23 @@ void beacon_signal_tick(BeaconSignal* signal, uint64_t now_ms)
         }
     }
     free_doomed(signal, now_ms);
+}
+
+bool beacon_signal_guest_room_live(const BeaconSignal* signal, const BeaconId* room)
+{
+    if (signal->rooms.empty())
+    {
+        return false;
+    }
+    uint32_t free_slot = BEACON_SIGNAL_NONE;
+    uint32_t slot = room_find(signal, room, &free_slot);
+    if (slot == BEACON_SIGNAL_NONE)
+    {
+        return false;
+    }
+    const BeaconRoom* found = &signal->rooms[slot];
+    return found->guest_room != 0 && found->host != BEACON_SIGNAL_NONE &&
+           signal->connections[found->host].state == BeaconConnectionState::OPEN;
 }
 
 void beacon_signal_stats_reset(BeaconSignal* signal)

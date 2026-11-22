@@ -107,6 +107,14 @@ constexpr uint32_t BEACON_SIGNALING_SIZE_REFUSED = 28;
 constexpr uint32_t BEACON_SIGNALING_SIZE_ROOM = 24;
 constexpr uint32_t BEACON_SIGNALING_SIGNAL_HEADER = 24;
 constexpr uint32_t BEACON_SIGNALING_MAX_SIZE = BEACON_SIGNALING_SIGNAL_HEADER + BEACON_SIGNALING_MAX_BLOB;
+// Guest rooms (guest links): GUEST_JOINED / GUEST_LEFT carry the guest's
+// index after the room; GUEST_SIGNAL's blob starts after the index and three
+// zero bytes, so its blob is 4 bytes shorter than SIGNAL's at most (a guest's
+// SIGNAL becomes the host's GUEST_SIGNAL, and the other way round).
+constexpr uint32_t BEACON_SIGNALING_SIZE_GUEST = 28;
+constexpr uint32_t BEACON_SIGNALING_GUEST_SIGNAL_HEADER = 28;
+constexpr uint32_t BEACON_SIGNALING_MAX_GUEST_BLOB = BEACON_SIGNALING_MAX_SIZE - BEACON_SIGNALING_GUEST_SIGNAL_HEADER;
+constexpr uint32_t BEACON_SIGNALING_MAX_GUESTS = 8;     // guests in one guest room
 
 enum class BeaconSignalingType : uint8_t
 {
@@ -118,18 +126,26 @@ enum class BeaconSignalingType : uint8_t
     SIGNAL = 21,        // both: room, blob (passed to the other side as is)
     NOT_FOUND = 22,     // s->c: room (a SIGNAL with no one on the other side)
     REFUSED = 23,       // s->c: room, reason (a JOIN over a limit)
+    GUEST_JOINED = 24,  // s->c: room, guest (to a guest room's host)
+    GUEST_LEFT = 25,    // s->c: room, guest (to a guest room's host)
+    GUEST_SIGNAL = 26,  // both, host only: room, guest, blob (to / from that guest)
 };
 
 enum class BeaconRole : uint8_t
 {
     HOST = 1,
     CLIENT = 2,
+    GUEST_HOST = 3,     // a guest room's host: one, with up to BEACON_SIGNALING_MAX_GUESTS guests
+    GUEST = 4,          // a guest: the room must have its host already
 };
 
 enum class BeaconRefusal : uint8_t
 {
     ROOMS_PER_CONNECTION = 1,   // this socket is in too many rooms
     ROOMS_FULL = 2,             // the server's room table is full
+    GUESTS_FULL = 3,            // the guest room has BEACON_SIGNALING_MAX_GUESTS guests, or no guest room is free
+    ROOM_KIND = 4,              // a guest role on a plain room, or the other way round
+    GUEST_RATE = 5,             // this socket joined guest rooms too often
 };
 
 struct BeaconSignalingMessage
@@ -138,9 +154,10 @@ struct BeaconSignalingMessage
     BeaconId room = {};                 // every type; never zero
     BeaconRole role = BeaconRole::HOST; // JOIN
     uint8_t peer_present = 0;           // JOINED: 0 or 1
+    uint8_t guest = 0;                  // GUEST_JOINED, GUEST_LEFT, GUEST_SIGNAL: 0 to BEACON_SIGNALING_MAX_GUESTS - 1
     BeaconRefusal reason = BeaconRefusal::ROOMS_PER_CONNECTION;  // REFUSED
-    const uint8_t* blob = nullptr;      // SIGNAL: points into the decoded data
-    uint32_t blob_size = 0;             // SIGNAL: 1-4096
+    const uint8_t* blob = nullptr;      // SIGNAL, GUEST_SIGNAL: points into the decoded data
+    uint32_t blob_size = 0;             // SIGNAL: 1-4096; GUEST_SIGNAL: 1-4092
 };
 
 // True if `data` is exactly one valid signaling message (fields as above,
