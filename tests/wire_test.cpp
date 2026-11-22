@@ -122,12 +122,28 @@ static uint32_t sample_messages(BeaconMessage* out)
     m.nonce = 12;
     m.ids[0] = make_id(203);
     out[n++] = m;
+
+    m = BeaconMessage{};
+    m.type = BeaconType::PRESENCE;
+    m.nonce = 13;
+    m.id_count = 3;
+    m.ids[0] = make_id(210);
+    m.ids[1] = make_id(211);
+    m.ids[2] = make_id(212);
+    out[n++] = m;
+
+    m = BeaconMessage{};
+    m.type = BeaconType::PRESENT;
+    m.nonce = 14;
+    m.present = 0x05;
+    out[n++] = m;
     return n;
 }
 
 static bool messages_equal(const BeaconMessage* a, const BeaconMessage* b)
 {
     if (a->type != b->type || a->nonce != b->nonce || a->id_count != b->id_count || a->ttl_seconds != b->ttl_seconds ||
+        a->present != b->present ||
         memcmp(a->cookie, b->cookie, sizeof(a->cookie)) != 0 || !beacon_address_equal(&a->address, &b->address))
     {
         return false;
@@ -211,7 +227,7 @@ static void test_header_rejects()
     {
         memcpy(bad, packet, size);
         bad[5] = static_cast<uint8_t>(type);
-        bool known = type >= 1 && type <= 9;
+        bool known = type >= 1 && type <= 11;
         if (!known)
         {
             check(!beacon_decode(bad, size, &decoded), "unknown type is refused");
@@ -262,6 +278,14 @@ static void test_padding_rejects()
             case BeaconType::INTRO:
                 zero_from = 50;
                 zero_to = 52;
+                break;
+            case BeaconType::PRESENCE:
+                zero_from = 17;
+                zero_to = 20;
+                break;
+            case BeaconType::PRESENT:
+                zero_from = 17;
+                zero_to = 20;
                 break;
             default:
                 break;
