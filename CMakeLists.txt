@@ -73,8 +73,21 @@ if(NOT MSVC)
     target_compile_options(beacon_dep_monocypher PRIVATE -O2)
 endif()
 
+# --- The guest links' join page, compiled in --------------------------------
+# One source for the page (packaging/join/index.html, kept in step with the
+# sites' look by the Site look workflow); beacon serves it from memory.
+set(BEACON_JOIN_PAGE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/join/index.html")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BEACON_JOIN_PAGE_SOURCE}")
+file(READ "${BEACON_JOIN_PAGE_SOURCE}" BEACON_JOIN_PAGE_TEXT)
+string(FIND "${BEACON_JOIN_PAGE_TEXT}" ")BEACON_JOIN_PAGE" BEACON_JOIN_PAGE_CLASH)
+if(NOT BEACON_JOIN_PAGE_CLASH EQUAL -1)
+    message(FATAL_ERROR "packaging/join/index.html contains the raw string's delimiter")
+endif()
+configure_file(server/beacon_join_page.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/beacon_join_page.h" @ONLY)
+
 # --- The server, as a library (the tests use it) plus main.cpp --------------
 add_library(beacon_core STATIC
+    server/beacon_http.cpp
     server/beacon_log.cpp
     server/beacon_random.cpp
     server/beacon_server.cpp
@@ -83,7 +96,7 @@ add_library(beacon_core STATIC
     server/beacon_stun.cpp
     server/beacon_ws.cpp
     server/beacon_signal.cpp)
-target_include_directories(beacon_core PUBLIC server)
+target_include_directories(beacon_core PUBLIC server PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(beacon_core PUBLIC beacon_wire PRIVATE beacon_dep_monocypher)
 beacon_set_flags(beacon_core)
 
@@ -118,6 +131,11 @@ if(BEACON_TESTS)
     target_link_libraries(beacon_ws_test PRIVATE beacon_core)
     beacon_set_flags(beacon_ws_test)
     add_test(NAME ws COMMAND beacon_ws_test)
+
+    add_executable(beacon_http_test tests/http_test.cpp)
+    target_link_libraries(beacon_http_test PRIVATE beacon_core)
+    beacon_set_flags(beacon_http_test)
+    add_test(NAME http COMMAND beacon_http_test)
 
     add_executable(beacon_signal_test tests/signal_test.cpp)
     target_link_libraries(beacon_signal_test PRIVATE beacon_core)
@@ -155,6 +173,11 @@ if(BEACON_TESTS)
     target_link_libraries(beacon_fuzz_ws_frame_replay PRIVATE beacon_core)
     beacon_set_flags(beacon_fuzz_ws_frame_replay)
     add_test(NAME fuzz_ws_frame_replay COMMAND beacon_fuzz_ws_frame_replay frame)
+
+    add_executable(beacon_fuzz_http_replay tests/fuzz_http_replay.cpp tests/fuzz_http.cpp)
+    target_link_libraries(beacon_fuzz_http_replay PRIVATE beacon_core)
+    beacon_set_flags(beacon_fuzz_http_replay)
+    add_test(NAME fuzz_http_replay COMMAND beacon_fuzz_http_replay)
 
     add_executable(beacon_fuzz_status_replay tests/fuzz_status_replay.cpp tests/fuzz_status.cpp)
     target_link_libraries(beacon_fuzz_status_replay PRIVATE beacon_core)
@@ -207,6 +230,14 @@ if(BEACON_TESTS)
         target_compile_options(beacon_fuzz_ws_frame PRIVATE -fsanitize=fuzzer,address,undefined)
         target_link_options(beacon_fuzz_ws_frame PRIVATE -fsanitize=fuzzer,address,undefined)
         add_test(NAME fuzz_ws_frame COMMAND beacon_fuzz_ws_frame -runs=2000000 -seed=1)
+
+        add_executable(beacon_fuzz_http tests/fuzz_http.cpp server/beacon_http.cpp wire/beacon_wire.cpp)
+        target_include_directories(beacon_fuzz_http PRIVATE wire server "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        target_link_libraries(beacon_fuzz_http PRIVATE beacon_dep_monocypher)
+        beacon_set_flags(beacon_fuzz_http)
+        target_compile_options(beacon_fuzz_http PRIVATE -fsanitize=fuzzer,address,undefined)
+        target_link_options(beacon_fuzz_http PRIVATE -fsanitize=fuzzer,address,undefined)
+        add_test(NAME fuzz_http COMMAND beacon_fuzz_http -runs=2000000 -seed=1)
 
         add_executable(beacon_fuzz_status tests/fuzz_status.cpp server/beacon_status.cpp server/beacon_log.cpp)
         target_include_directories(beacon_fuzz_status PRIVATE server)

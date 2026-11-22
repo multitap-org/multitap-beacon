@@ -25,6 +25,13 @@
 //   a slot never breaks another room's search). Rooms never move, so a
 //   connection keeps its rooms' slot numbers.
 //
+// HTTP (beacon_http.h): a request without an Upgrade header is plain HTTP:
+// the guest links' join page, their cards, and the hosts' card uploads. One
+// request per connection (Connection: close). A card is kept in memory only,
+// one per guest room, and deleted BEACON_CARD_ORPHAN_MS after its guest room
+// ends. Pages and uploads take a slot from small pools allocated at open;
+// with none free the answer is 503.
+//
 // The caller owns the epoll loop: beacon_signal_open() registers the
 // listening socket with tag BEACON_SIGNAL_TAG_LISTEN, and each connection
 // with BEACON_SIGNAL_TAG_FIRST_CONNECTION + its index; the caller hands
@@ -33,6 +40,7 @@
 // inline, and one that can't take it is freed after the current event, so
 // handling one connection never frees another in the middle.
 
+#include "beacon_http.h"
 #include "beacon_ws.h"
 
 #include <cstdint>
@@ -57,6 +65,12 @@ constexpr uint32_t BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION = 64;
 constexpr uint32_t BEACON_SIGNAL_PROBE_WINDOW = 32;
 constexpr uint32_t BEACON_SIGNAL_MAX_TRUSTED = 8;
 constexpr uint32_t BEACON_SIGNAL_NONE = 0xffffffffu;
+constexpr uint64_t BEACON_HTTP_BODY_MS = 20000;         // to receive a card upload's body
+constexpr uint64_t BEACON_HTTP_SEND_MS = 30000;         // to send a response (a card is up to 256 KiB)
+constexpr uint64_t BEACON_CARD_ORPHAN_MS = 60000;       // a card outlives its guest room this long (a host's reconnect)
+constexpr uint32_t BEACON_HTTP_PAGE_SIZE = 48 * 1024;   // a rendered join page
+constexpr uint32_t BEACON_CARD_PUTS_PER_MINUTE = 4;     // per card: replacing it
+constexpr uint32_t BEACON_MAX_PUBLIC_URL = 128;
 
 // An address range: `prefix` bits of `ip` (IPv4 as ::ffff:a.b.c.d, so an
 // IPv4 /n is 96 + n).
@@ -77,6 +91,12 @@ struct BeaconSignalConfig
     uint32_t byte_burst = 65536;
     uint32_t guest_joins_per_minute = 10;   // per connection: JOINs as a guest
     uint32_t guest_join_burst = 5;
+    uint32_t max_cards = 64;                // in memory, BEACON_CARD_MAX_PNG each
+    uint32_t page_slots = 32;               // join pages being sent at once
+    uint32_t upload_slots = 4;              // card uploads being received at once
+    // The scheme and host in the card's absolute URLs ("https://beacon.example");
+    // empty: "https://" + the request's Host.
+    char public_url[BEACON_MAX_PUBLIC_URL + 1] = {};
     // Proxies whose X-Forwarded-For is believed (loopback always is).
     BeaconCidr trusted[BEACON_SIGNAL_MAX_TRUSTED] = {};
     uint32_t trusted_count = 0;
@@ -87,7 +107,15 @@ enum class BeaconConnectionState : uint8_t
     FREE,
     HANDSHAKE,      // waiting for the HTTP request
     OPEN,           // frames
-    CLOSING,        // a close frame or an HTTP error queued: input ignored, closed once sent
+    CLOSING,        // a close frame or an HTTP response queued: input ignored, closed once sent
+    HTTP_BODY,      // receiving a card upload's body
+};
+
+enum class BeaconBodyKind : uint8_t
+{
+    NONE,
+    PAGE,           // a page slot
+    CARD,           // a card's PNG (dropped if the card changes meanwhile)
 };
 
 struct BeaconConnection
@@ -110,6 +138,16 @@ struct BeaconConnection
     uint32_t rooms[BEACON_SIGNAL_MAX_ROOMS_PER_CONNECTION] = {};   // room table slots
     uint32_t receive_used = 0;
     uint32_t send_used = 0;
+    // HTTP: the upload being received, or the body being sent after the head.
+    BeaconJoinRoute route = {};
+    uint32_t upload_slot = BEACON_SIGNAL_NONE;
+    uint32_t upload_size = 0;           // the Content-Length
+    uint32_t upload_used = 0;
+    BeaconBodyKind body_kind = BeaconBodyKind::NONE;
+    uint32_t body_index = BEACON_SIGNAL_NONE;   // page slot or card
+    uint32_t body_generation = 0;               // CARD: the card's generation when it started
+    uint32_t body_offset = 0;
+    uint32_t body_size = 0;
     uint8_t receive[BEACON_SIGNAL_RECEIVE_SIZE] = {};
     uint8_t send[BEACON_SIGNAL_SEND_SIZE] = {};
 };
@@ -124,6 +162,19 @@ struct BeaconRoom
                                                     BEACON_SIGNAL_NONE, BEACON_SIGNAL_NONE};
     uint8_t used = 0;
     uint8_t guest_room = 0;                 // made by a GUEST_HOST JOIN
+};
+
+struct BeaconCard
+{
+    uint8_t used = 0;
+    char room[BEACON_GUEST_ROOM_SIZE + 1] = {};
+    BeaconId meeting = {};                  // the guest room it belongs to
+    char title[BEACON_CARD_MAX_TITLE + 1] = {};
+    uint32_t png_size = 0;                  // the PNG: card_data[index * BEACON_CARD_MAX_PNG, + png_size)
+    uint32_t generation = 0;                // bumped when replaced or deleted
+    uint64_t orphan_since_ms = 0;           // its guest room is gone since (0: it's live)
+    uint64_t puts_last_ms = 0;
+    uint64_t put_tokens_milli = 0;
 };
 
 struct BeaconSignalStats
@@ -144,8 +195,13 @@ struct BeaconSignalStats
     uint64_t protocol_errors = 0;       // a frame or message broke a rule
     uint64_t timeouts = 0;              // handshake, idle or closing
     uint64_t slow_readers = 0;          // closed because the send buffer was full
+    uint64_t http_requests = 0;
+    uint64_t http_refused = 0;          // 4xx / 5xx answers
+    uint64_t cards_put = 0;
+    uint64_t cards_deleted = 0;
     uint32_t open = 0;                  // connections in use now
     uint32_t rooms = 0;                 // rooms in use now
+    uint32_t cards = 0;                 // cards in memory now
 };
 
 struct BeaconSignal
@@ -161,6 +217,12 @@ struct BeaconSignal
     std::vector<BeaconRoom> rooms;
     uint32_t room_mask = 0;
     uint8_t hash_key[32] = {};
+    std::vector<BeaconCard> cards;
+    std::vector<uint8_t> card_data;         // max_cards * BEACON_CARD_MAX_PNG
+    std::vector<uint8_t> page_used;         // page_slots flags
+    std::vector<uint8_t> page_data;         // page_slots * BEACON_HTTP_PAGE_SIZE
+    std::vector<uint8_t> upload_used;       // upload_slots flags
+    std::vector<uint8_t> upload_data;       // upload_slots * BEACON_CARD_MAX_UPLOAD
     int listen_fd = -1;
     int epoll_fd = -1;
     uint16_t port = 0;                  // the bound port (useful when 0 asked for any)
@@ -185,6 +247,9 @@ void beacon_signal_event(BeaconSignal* signal, uint32_t index, uint32_t events, 
 
 // Timeouts, about once a second.
 void beacon_signal_tick(BeaconSignal* signal, uint64_t now_ms);
+
+// The card of guest room `room` (13 base32 characters), or nullptr.
+const BeaconCard* beacon_signal_card(const BeaconSignal* signal, const char* room);
 
 // True if `room` is a guest room whose host is connected (cards live as long
 // as that).

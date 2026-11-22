@@ -32,6 +32,16 @@ For browsers (WebRTC), which can't send raw UDP, it also is:
    end to end by the peers: beacon passes them along without being able to
    read them. The connection itself is then direct, as with UDP.
 
+For guest links (a piccolo streaming to friends who open a link, piccolo's
+REMOTE PLAY TOGETHER):
+
+6. **Guest rooms**: one host and up to 8 guests in one signaling room.
+7. **The join page and its card**: `https://<beacon>/join/<room>#<token>`
+   opens piccoletto, and carries the card chat apps show for the link (the
+   game's name and one screenshot, uploaded by the host). The token after the
+   `#` never reaches beacon. The card is kept in memory only, and deleted a
+   minute after the host's session ends.
+
 The wire format is in [`PROTOCOL.md`](PROTOCOL.md): every message is a fixed
 size binary struct, nothing is ever read as a length or a string, and a reply
 is never bigger than the request that caused it (so the server can't be used
@@ -46,7 +56,9 @@ bytes for a 20-byte request, as on every STUN server; the rate limits cap it.
   it couldn't connect. That keeps a server nearly free to run: it handles a
   few tiny packets per connection, never a game stream.
 - No accounts, no logins, no device names, no storage on disk. A restart
-  forgets everything; hosts re-register within 20 seconds.
+  forgets everything; hosts re-register within 20 seconds. The one thing a
+  user puts on it is a guest link's card (a game's name and a screenshot),
+  in memory, while that session lasts.
 - It doesn't log meeting ids or addresses, only counts (packets, registrations,
   introductions, drops).
 - It doesn't authenticate itself (yet): a later version adds a signed
@@ -159,7 +171,8 @@ server; use a VPS then.
 `packaging/status/` is a public page that shows how many clients are online
 on the beacon right now and how many pairings (introductions) it made in the
 last hour, with charts of the last 7 days, 30 days and 12 months below.
-beacon itself serves no HTTP: with `--status-file PATH` it writes counts
+beacon itself doesn't serve this page (its only HTTP is the guest links'
+`/join/`, below): with `--status-file PATH` it writes counts
 (never ids or addresses) every 10 seconds, replacing the file atomically:
 
 ```json
@@ -287,6 +300,18 @@ TCP 55432 closed to the outside (it's only on the bridge address).
 Without a proxy (testing only): `--signal-bind 0.0.0.0` exposes plain `ws://`,
 which only pages served over http can use.
 
+### Guest links (`/join/`)
+
+The same listener answers plain HTTP for guest links: `GET /join/<room>` (the
+join page, compiled in from [`packaging/join/index.html`](packaging/join/index.html)),
+`GET /join/<room>/card.png` and the host's `POST /join/<room>/card`. Send
+`/join/` to beacon like `/signal` (Caddy: `handle /join/*`; NPM: a custom
+location `/join/` to the same forward host, Cache Assets off). The page
+takes the sites' look from `/status/_site/v1/` on the same name, so serve the
+status page there too (without it the page works, unstyled). Cards' absolute
+URLs use `https://` + the request's Host unless `--public-url` says
+otherwise; `--max-cards N` (default 64, 256 KiB each) caps them.
+
 ## Ports and firewall
 
 | port | protocol | what |
@@ -346,7 +371,7 @@ All memory is allocated at startup; nothing is allocated per packet.
 |---|---|
 | default (65536 ids, 65536 sources) | 14 MiB (RSS about 18 MiB) |
 | 1M ids, 1M sources | 225 MiB |
-| signaling (1024 connections, 65536 rooms) | 16.4 MiB (12.6 KiB per connection) |
+| signaling (1024 connections, 65536 rooms, 64 cards) | 38.9 MiB (12.9 KiB per connection, 16 MiB of cards) |
 
 Signaling connections have fixed buffers (4.25 KiB in, 8.25 KiB out); one
 whose reader is too slow for what's sent to it is closed, never queued

@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <netinet/in.h>
@@ -408,10 +409,31 @@ static void leave_all_rooms(BeaconSignal* signal, uint32_t index, uint64_t now_m
 // Connection lifetime
 // ---------------------------------------------------------------------------
 
+// Gives back an HTTP connection's upload and page slots.
+static void release_http(BeaconSignal* signal, BeaconConnection* connection)
+{
+    if (connection->upload_slot != BEACON_SIGNAL_NONE)
+    {
+        signal->upload_used[connection->upload_slot] = 0;
+        connection->upload_slot = BEACON_SIGNAL_NONE;
+    }
+    if (connection->body_kind == BeaconBodyKind::PAGE && connection->body_index != BEACON_SIGNAL_NONE)
+    {
+        signal->page_used[connection->body_index] = 0;
+    }
+    connection->body_kind = BeaconBodyKind::NONE;
+    connection->body_index = BEACON_SIGNAL_NONE;
+    connection->body_offset = 0;
+    connection->body_size = 0;
+    connection->upload_size = 0;
+    connection->upload_used = 0;
+}
+
 static void connection_free(BeaconSignal* signal, uint32_t index, uint64_t now_ms)
 {
     BeaconConnection* connection = &signal->connections[index];
     leave_all_rooms(signal, index, now_ms);
+    release_http(signal, connection);
     if (connection->fd >= 0)
     {
         epoll_ctl(signal->epoll_fd, EPOLL_CTL_DEL, connection->fd, nullptr);
@@ -448,9 +470,50 @@ static void free_doomed(BeaconSignal* signal, uint64_t now_ms)
 
 // Sends what the buffer holds. Returns false if the connection was freed (an
 // error, or a CLOSING connection that finished sending).
+// Moves the next piece of an HTTP body into the send buffer (after what's
+// there). False if the body can't go on: its card was replaced or deleted.
+static bool refill_body(BeaconSignal* signal, BeaconConnection* connection)
+{
+    if (connection->body_kind == BeaconBodyKind::NONE || connection->body_offset >= connection->body_size)
+    {
+        return true;
+    }
+    const uint8_t* source = nullptr;
+    if (connection->body_kind == BeaconBodyKind::PAGE)
+    {
+        source = signal->page_data.data() + static_cast<size_t>(connection->body_index) * BEACON_HTTP_PAGE_SIZE;
+    }
+    else
+    {
+        const BeaconCard* card = &signal->cards[connection->body_index];
+        if (card->used == 0 || card->generation != connection->body_generation)
+        {
+            return false;
+        }
+        source = signal->card_data.data() + static_cast<size_t>(connection->body_index) * BEACON_CARD_MAX_PNG;
+    }
+    size_t room = BEACON_SIGNAL_SEND_SIZE - connection->send_used;
+    size_t left = connection->body_size - connection->body_offset;
+    size_t piece = left < room ? left : room;
+    memcpy(connection->send + connection->send_used, source + connection->body_offset, piece);
+    connection->send_used += static_cast<uint32_t>(piece);
+    connection->body_offset += static_cast<uint32_t>(piece);
+    return true;
+}
+
+static bool body_done(const BeaconConnection* connection)
+{
+    return connection->body_kind == BeaconBodyKind::NONE || connection->body_offset >= connection->body_size;
+}
+
 static bool connection_flush(BeaconSignal* signal, uint32_t index, uint64_t now_ms)
 {
     BeaconConnection* connection = &signal->connections[index];
+    if (!refill_body(signal, connection))
+    {
+        connection_free(signal, index, now_ms);
+        return false;
+    }
     size_t sent_total = 0;
     while (sent_total < connection->send_used)
     {
@@ -470,13 +533,24 @@ static bool connection_flush(BeaconSignal* signal, uint32_t index, uint64_t now_
             return false;
         }
         sent_total += static_cast<size_t>(sent);
+        if (sent_total == connection->send_used && !body_done(connection))
+        {
+            // All out: the next piece of the body.
+            connection->send_used = 0;
+            sent_total = 0;
+            if (!refill_body(signal, connection))
+            {
+                connection_free(signal, index, now_ms);
+                return false;
+            }
+        }
     }
     if (sent_total > 0)
     {
         memmove(connection->send, connection->send + sent_total, connection->send_used - sent_total);
         connection->send_used -= static_cast<uint32_t>(sent_total);
     }
-    if (connection->send_used == 0 && connection->state == BeaconConnectionState::CLOSING)
+    if (connection->send_used == 0 && connection->state == BeaconConnectionState::CLOSING && body_done(connection))
     {
         connection_free(signal, index, now_ms);
         return false;
@@ -919,6 +993,325 @@ static bool handle_message(BeaconSignal* signal, uint32_t index, const uint8_t* 
     return signal->connections[index].state == BeaconConnectionState::OPEN;
 }
 
+// ---------------------------------------------------------------------------
+// HTTP: join pages, cards, card uploads
+// ---------------------------------------------------------------------------
+
+static uint32_t card_find(const BeaconSignal* signal, const char* room)
+{
+    for (uint32_t i = 0; i < signal->cards.size(); i++)
+    {
+        const BeaconCard* card = &signal->cards[i];
+        if (card->used != 0 && memcmp(card->room, room, BEACON_GUEST_ROOM_SIZE) == 0)
+        {
+            return i;
+        }
+    }
+    return BEACON_SIGNAL_NONE;
+}
+
+static void card_delete(BeaconSignal* signal, uint32_t index)
+{
+    BeaconCard* card = &signal->cards[index];
+    uint32_t generation = card->generation + 1;
+    *card = BeaconCard{};
+    // Kept, so a send that started before can tell (refill_body).
+    card->generation = generation;
+    signal->stats.cards--;
+    signal->stats.cards_deleted++;
+}
+
+static uint32_t slot_take(std::vector<uint8_t>* used)
+{
+    for (uint32_t i = 0; i < used->size(); i++)
+    {
+        if ((*used)[i] == 0)
+        {
+            (*used)[i] = 1;
+            return i;
+        }
+    }
+    return BEACON_SIGNAL_NONE;
+}
+
+// A whole response with no body (or a short text one), then the connection closes.
+static void http_answer(BeaconSignal* signal, BeaconConnection* connection, uint32_t status, uint64_t now_ms)
+{
+    if (status >= 400)
+    {
+        signal->stats.http_refused++;
+    }
+    char head[512];
+    size_t size = beacon_http_response_head(status, nullptr, nullptr, 0, head, sizeof(head));
+    connection->send_used = 0;
+    queue_bytes(connection, reinterpret_cast<const uint8_t*>(head), size);
+    connection->state = BeaconConnectionState::CLOSING;
+    connection->deadline_ms = now_ms + BEACON_SIGNAL_CLOSING_MS;
+    connection->receive_used = 0;
+}
+
+// The scheme and host for absolute URLs.
+static void http_base(const BeaconSignal* signal, const BeaconHttpRequest* request, char* out, size_t capacity)
+{
+    if (signal->config.public_url[0] != '\0')
+    {
+        snprintf(out, capacity, "%s", signal->config.public_url);
+    }
+    else if (request->host[0] != '\0')
+    {
+        snprintf(out, capacity, "https://%s", request->host);
+    }
+    else
+    {
+        out[0] = '\0';
+    }
+}
+
+static const char PAGE_HEADERS[] =
+    "Cache-Control: no-store\r\n"
+    "Referrer-Policy: no-referrer\r\n"
+    "X-Robots-Tag: noindex\r\n"
+    "Content-Security-Policy: default-src 'none'; img-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "font-src 'self'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\r\n";
+
+static void http_page(BeaconSignal* signal, uint32_t index, const BeaconHttpRequest* request, uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    uint32_t slot = slot_take(&signal->page_used);
+    if (slot == BEACON_SIGNAL_NONE)
+    {
+        http_answer(signal, connection, 503, now_ms);
+        return;
+    }
+    char base[BEACON_MAX_PUBLIC_URL + BEACON_HTTP_MAX_HOST + 16];
+    http_base(signal, request, base, sizeof(base));
+    char image[sizeof(base) + 64];
+    char url[sizeof(base) + 64];
+    snprintf(url, sizeof(url), "%s/join/%s", base, connection->route.room);
+    uint32_t card = card_find(signal, connection->route.room);
+    const char* title = "A piccolo session";
+    if (card != BEACON_SIGNAL_NONE)
+    {
+        title = signal->cards[card].title;
+        snprintf(image, sizeof(image), "%s/join/%s/card.png", base, connection->route.room);
+    }
+    else
+    {
+        snprintf(image, sizeof(image), "%s/status/_site/v1/img/piccolo-icon-256.png", base);
+    }
+    static const char DESCRIPTION[] = "Join this game on piccolo: watch it, and play when a seat is free.";
+    char* page = reinterpret_cast<char*>(signal->page_data.data() + static_cast<size_t>(slot) * BEACON_HTTP_PAGE_SIZE);
+    size_t size = beacon_join_page_render(beacon_join_page_builtin(), title, DESCRIPTION, image, url, page,
+                                          BEACON_HTTP_PAGE_SIZE);
+    if (size == 0)
+    {
+        signal->page_used[slot] = 0;
+        http_answer(signal, connection, 503, now_ms);
+        return;
+    }
+    char head[1024];
+    size_t head_size = beacon_http_response_head(200, "text/html; charset=utf-8", PAGE_HEADERS, size, head, sizeof(head));
+    connection->send_used = 0;
+    queue_bytes(connection, reinterpret_cast<const uint8_t*>(head), head_size);
+    connection->body_kind = BeaconBodyKind::PAGE;
+    connection->body_index = slot;
+    connection->body_offset = 0;
+    connection->body_size = request->method == BeaconHttpMethod::HEAD ? 0 : static_cast<uint32_t>(size);
+    connection->state = BeaconConnectionState::CLOSING;
+    connection->deadline_ms = now_ms + BEACON_HTTP_SEND_MS;
+    connection->receive_used = 0;
+}
+
+static void http_card_png(BeaconSignal* signal, uint32_t index, const BeaconHttpRequest* request, uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    uint32_t card = card_find(signal, connection->route.room);
+    if (card == BEACON_SIGNAL_NONE)
+    {
+        http_answer(signal, connection, 404, now_ms);
+        return;
+    }
+    char head[512];
+    size_t head_size = beacon_http_response_head(200, "image/png", "Cache-Control: public, max-age=300\r\n",
+                                                 signal->cards[card].png_size, head, sizeof(head));
+    connection->send_used = 0;
+    queue_bytes(connection, reinterpret_cast<const uint8_t*>(head), head_size);
+    connection->body_kind = BeaconBodyKind::CARD;
+    connection->body_index = card;
+    connection->body_generation = signal->cards[card].generation;
+    connection->body_offset = 0;
+    connection->body_size = request->method == BeaconHttpMethod::HEAD ? 0 : signal->cards[card].png_size;
+    connection->state = BeaconConnectionState::CLOSING;
+    connection->deadline_ms = now_ms + BEACON_HTTP_SEND_MS;
+    connection->receive_used = 0;
+}
+
+// The whole upload body is in: check it, put the card, answer.
+static void http_upload_done(BeaconSignal* signal, uint32_t index, uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    const uint8_t* body =
+        signal->upload_data.data() + static_cast<size_t>(connection->upload_slot) * BEACON_CARD_MAX_UPLOAD;
+    BeaconCardUpload upload;
+    if (!beacon_card_parse_upload(body, connection->upload_size, &upload))
+    {
+        release_http(signal, connection);
+        http_answer(signal, connection, 400, now_ms);
+        return;
+    }
+    char room[BEACON_GUEST_ROOM_SIZE + 1];
+    beacon_guest_room_from_card_key(upload.card_key, room);
+    if (memcmp(room, connection->route.room, BEACON_GUEST_ROOM_SIZE) != 0)
+    {
+        release_http(signal, connection);
+        http_answer(signal, connection, 403, now_ms);
+        return;
+    }
+    BeaconId meeting;
+    beacon_guest_meeting_id(room, &meeting);
+    if (!beacon_signal_guest_room_live(signal, &meeting))
+    {
+        release_http(signal, connection);
+        http_answer(signal, connection, 404, now_ms);
+        return;
+    }
+    uint32_t card_index = card_find(signal, room);
+    if (card_index == BEACON_SIGNAL_NONE)
+    {
+        for (uint32_t i = 0; i < signal->cards.size(); i++)
+        {
+            if (signal->cards[i].used == 0)
+            {
+                card_index = i;
+                break;
+            }
+        }
+        if (card_index == BEACON_SIGNAL_NONE)
+        {
+            release_http(signal, connection);
+            http_answer(signal, connection, 503, now_ms);
+            return;
+        }
+        BeaconCard* fresh = &signal->cards[card_index];
+        uint32_t generation = fresh->generation;
+        *fresh = BeaconCard{};
+        fresh->generation = generation;
+        fresh->used = 1;
+        memcpy(fresh->room, room, sizeof(fresh->room));
+        fresh->meeting = meeting;
+        fresh->puts_last_ms = now_ms;
+        fresh->put_tokens_milli = static_cast<uint64_t>(BEACON_CARD_PUTS_PER_MINUTE) * MILLI * 60;
+        signal->stats.cards++;
+    }
+    BeaconCard* card = &signal->cards[card_index];
+    if (!bucket_take_per_minute(&card->put_tokens_milli, &card->puts_last_ms, now_ms, BEACON_CARD_PUTS_PER_MINUTE,
+                                BEACON_CARD_PUTS_PER_MINUTE))
+    {
+        release_http(signal, connection);
+        http_answer(signal, connection, 429, now_ms);
+        return;
+    }
+    memcpy(signal->card_data.data() + static_cast<size_t>(card_index) * BEACON_CARD_MAX_PNG, upload.png,
+           upload.png_size);
+    card->png_size = upload.png_size;
+    memcpy(card->title, upload.title, sizeof(card->title));
+    card->generation++;
+    card->orphan_since_ms = 0;
+    signal->stats.cards_put++;
+    release_http(signal, connection);
+    http_answer(signal, connection, 204, now_ms);
+}
+
+// Copies upload bytes from `data` into the connection's upload slot; when
+// the body is whole, finishes it.
+static void http_upload_take(BeaconSignal* signal, uint32_t index, const uint8_t* data, size_t size, uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    size_t want = connection->upload_size - connection->upload_used;
+    size_t take = size < want ? size : want;
+    uint8_t* slot = signal->upload_data.data() + static_cast<size_t>(connection->upload_slot) * BEACON_CARD_MAX_UPLOAD;
+    memcpy(slot + connection->upload_used, data, take);
+    connection->upload_used += static_cast<uint32_t>(take);
+    if (connection->upload_used == connection->upload_size)
+    {
+        http_upload_done(signal, index, now_ms);
+    }
+}
+
+// A plain HTTP request (no Upgrade header) has been parsed.
+static void http_request(BeaconSignal* signal, uint32_t index, const BeaconHttpRequest* request, uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    signal->stats.http_requests++;
+    if (!beacon_http_join_route(request->target, &connection->route))
+    {
+        http_answer(signal, connection, 404, now_ms);
+        return;
+    }
+    bool post = request->method == BeaconHttpMethod::POST;
+    if (connection->route.kind == BeaconJoinKind::CARD_PUT)
+    {
+        if (!post)
+        {
+            http_answer(signal, connection, 404, now_ms);
+            return;
+        }
+        if (!request->has_content_length)
+        {
+            http_answer(signal, connection, 400, now_ms);
+            return;
+        }
+        if (request->content_length > BEACON_CARD_MAX_UPLOAD)
+        {
+            http_answer(signal, connection, 413, now_ms);
+            return;
+        }
+        // Checked before the body comes: a room with no live host can't take a card.
+        BeaconId meeting;
+        beacon_guest_meeting_id(connection->route.room, &meeting);
+        if (!beacon_signal_guest_room_live(signal, &meeting))
+        {
+            http_answer(signal, connection, 404, now_ms);
+            return;
+        }
+        uint32_t slot = slot_take(&signal->upload_used);
+        if (slot == BEACON_SIGNAL_NONE)
+        {
+            http_answer(signal, connection, 503, now_ms);
+            return;
+        }
+        connection->upload_slot = slot;
+        connection->upload_size = static_cast<uint32_t>(request->content_length);
+        connection->upload_used = 0;
+        connection->state = BeaconConnectionState::HTTP_BODY;
+        connection->deadline_ms = now_ms + BEACON_HTTP_BODY_MS;
+        // The body's first bytes may have come with the head.
+        size_t extra = connection->receive_used - request->head_size;
+        const uint8_t* first = connection->receive + request->head_size;
+        connection->receive_used = 0;
+        if (connection->upload_size == 0)
+        {
+            http_upload_done(signal, index, now_ms);
+            return;
+        }
+        http_upload_take(signal, index, first, extra, now_ms);
+        return;
+    }
+    if (post)
+    {
+        http_answer(signal, connection, 404, now_ms);
+        return;
+    }
+    if (connection->route.kind == BeaconJoinKind::PAGE)
+    {
+        http_page(signal, index, request, now_ms);
+    }
+    else
+    {
+        http_card_png(signal, index, request, now_ms);
+    }
+}
+
 // The handshake parsed: the client's source, its limit, then 101 or 429.
 static void finish_handshake(BeaconSignal* signal, uint32_t index, const BeaconWsHandshake* handshake, uint64_t now_ms)
 {
@@ -968,6 +1361,17 @@ static bool connection_process(BeaconSignal* signal, uint32_t index, uint64_t no
     size_t consumed = 0;
     if (connection->state == BeaconConnectionState::HANDSHAKE)
     {
+        BeaconHttpRequest request;
+        BeaconHttpParse http = beacon_http_parse_request(connection->receive, connection->receive_used, &request);
+        if (http == BeaconHttpParse::INCOMPLETE)
+        {
+            return true;
+        }
+        if (http == BeaconHttpParse::OK && !request.upgrade)
+        {
+            http_request(signal, index, &request, now_ms);
+            return true;
+        }
         BeaconWsHandshake handshake;
         BeaconWsParse result = beacon_ws_parse_handshake(connection->receive, connection->receive_used, &handshake);
         if (result == BeaconWsParse::INCOMPLETE)
@@ -1056,6 +1460,29 @@ static void connection_read(BeaconSignal* signal, uint32_t index, uint64_t now_m
         }
         return;
     }
+    if (connection->state == BeaconConnectionState::HTTP_BODY)
+    {
+        uint8_t* slot =
+            signal->upload_data.data() + static_cast<size_t>(connection->upload_slot) * BEACON_CARD_MAX_UPLOAD;
+        size_t want = connection->upload_size - connection->upload_used;
+        ssize_t body = recv(connection->fd, slot + connection->upload_used, want, MSG_DONTWAIT);
+        if (body < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        {
+            return;
+        }
+        if (body <= 0)
+        {
+            connection_free(signal, index, now_ms);
+            return;
+        }
+        connection->upload_used += static_cast<uint32_t>(body);
+        if (connection->upload_used == connection->upload_size)
+        {
+            http_upload_done(signal, index, now_ms);
+        }
+        connection_flush(signal, index, now_ms);
+        return;
+    }
     // The buffer always has room here: a full buffer is either a complete
     // frame (processed below) or refused by the parser's limits.
     size_t room = BEACON_SIGNAL_RECEIVE_SIZE - connection->receive_used;
@@ -1107,7 +1534,8 @@ bool beacon_signal_open(BeaconSignal* signal, const BeaconSignalConfig* config, 
         config->max_rooms < 1 || config->max_rooms > (1u << 24) || config->max_connections_per_source < 1 ||
         config->messages_per_second < 1 || config->message_burst < 1 || config->bytes_per_second < 1 ||
         config->byte_burst < BEACON_WS_MAX_PAYLOAD || config->trusted_count > BEACON_SIGNAL_MAX_TRUSTED ||
-        config->guest_joins_per_minute < 1 || config->guest_join_burst < 1)
+        config->guest_joins_per_minute < 1 || config->guest_join_burst < 1 || config->max_cards > 4096 ||
+        config->page_slots < 1 || config->page_slots > 1024 || config->upload_slots > 64)
     {
         beacon_log(BeaconLogLevel::error, "signaling: configuration out of range");
         return false;
@@ -1195,6 +1623,12 @@ bool beacon_signal_open(BeaconSignal* signal, const BeaconSignalConfig* config, 
         signal->free_slots[i] = config->max_connections - 1 - i;
     }
     signal->free_count = config->max_connections;
+    signal->cards.resize(config->max_cards);
+    signal->card_data.resize(static_cast<size_t>(config->max_cards) * BEACON_CARD_MAX_PNG);
+    signal->page_used.resize(config->page_slots);
+    signal->page_data.resize(static_cast<size_t>(config->page_slots) * BEACON_HTTP_PAGE_SIZE);
+    signal->upload_used.resize(config->upload_slots);
+    signal->upload_data.resize(static_cast<size_t>(config->upload_slots) * BEACON_CARD_MAX_UPLOAD);
     uint32_t room_slots = table_slots_for(config->max_rooms);
     signal->rooms.resize(room_slots);
     signal->room_mask = room_slots - 1;
@@ -1312,6 +1746,7 @@ void beacon_signal_tick(BeaconSignal* signal, uint64_t now_ms)
         {
             case BeaconConnectionState::HANDSHAKE:
             case BeaconConnectionState::CLOSING:
+            case BeaconConnectionState::HTTP_BODY:
                 if (now_ms >= connection->deadline_ms)
                 {
                     signal->stats.timeouts++;
@@ -1330,7 +1765,35 @@ void beacon_signal_tick(BeaconSignal* signal, uint64_t now_ms)
                 break;
         }
     }
+    // Cards follow their guest rooms, with a grace period for a host's
+    // reconnect.
+    for (uint32_t i = 0; i < signal->cards.size(); i++)
+    {
+        BeaconCard* card = &signal->cards[i];
+        if (card->used == 0)
+        {
+            continue;
+        }
+        if (beacon_signal_guest_room_live(signal, &card->meeting))
+        {
+            card->orphan_since_ms = 0;
+        }
+        else if (card->orphan_since_ms == 0)
+        {
+            card->orphan_since_ms = now_ms;
+        }
+        else if (now_ms - card->orphan_since_ms >= BEACON_CARD_ORPHAN_MS)
+        {
+            card_delete(signal, i);
+        }
+    }
     free_doomed(signal, now_ms);
+}
+
+const BeaconCard* beacon_signal_card(const BeaconSignal* signal, const char* room)
+{
+    uint32_t index = card_find(signal, room);
+    return index == BEACON_SIGNAL_NONE ? nullptr : &signal->cards[index];
 }
 
 bool beacon_signal_guest_room_live(const BeaconSignal* signal, const BeaconId* room)
@@ -1354,14 +1817,19 @@ void beacon_signal_stats_reset(BeaconSignal* signal)
 {
     uint32_t open = signal->stats.open;
     uint32_t rooms = signal->stats.rooms;
+    uint32_t cards = signal->stats.cards;
     signal->stats = BeaconSignalStats{};
     signal->stats.open = open;
     signal->stats.rooms = rooms;
+    signal->stats.cards = cards;
 }
 
 uint64_t beacon_signal_pool_bytes(const BeaconSignal* signal)
 {
     return static_cast<uint64_t>(signal->connections.size()) * sizeof(BeaconConnection) +
            static_cast<uint64_t>(signal->free_slots.size()) * sizeof(uint32_t) +
-           static_cast<uint64_t>(signal->rooms.size()) * sizeof(BeaconRoom);
+           static_cast<uint64_t>(signal->rooms.size()) * sizeof(BeaconRoom) +
+           static_cast<uint64_t>(signal->cards.size()) * sizeof(BeaconCard) + signal->card_data.size() +
+           signal->page_used.size() + signal->page_data.size() + signal->upload_used.size() +
+           signal->upload_data.size();
 }

@@ -79,6 +79,10 @@ static void print_usage(FILE* out)
             "  --max-rooms N             signaling rooms at once (default %" PRIu32 ")\n"
             "  --max-connections-per-source N\n"
             "                            signaling connections from one IPv4 address or IPv6 /64 (default %" PRIu32 ")\n"
+            "  --max-cards N             guest link cards kept in memory, 256 KiB each, 0 = no cards\n"
+            "                            (default %" PRIu32 ")\n"
+            "  --public-url URL          scheme and host for the guest links' absolute URLs, e.g.\n"
+            "                            https://beacon.example (default: https:// + the request's Host)\n"
             "  --trusted-proxy IP[/N]    a proxy whose X-Forwarded-For is believed, e.g. a Docker network\n"
             "                            (172.16.0.0/12); loopback always is; up to 8 times\n"
             "  --public-address IP       the server's public IPv4 or IPv6 address, for a server behind a NAT\n"
@@ -94,7 +98,8 @@ static void print_usage(FILE* out)
             static_cast<unsigned>(DEFAULT_PRIMARY_PORT), static_cast<unsigned>(DEFAULT_SECONDARY_PORT),
             defaults.max_entries, defaults.max_sources, defaults.max_ids_per_source, defaults.rate_per_second,
             defaults.burst, defaults.overflow_rate_per_second, static_cast<unsigned>(DEFAULT_SIGNAL_PORT),
-            signal_defaults.max_connections, signal_defaults.max_rooms, signal_defaults.max_connections_per_source);
+            signal_defaults.max_connections, signal_defaults.max_rooms, signal_defaults.max_connections_per_source,
+            signal_defaults.max_cards);
 }
 
 // A decimal number in [min, max], nothing else.
@@ -243,6 +248,31 @@ static int parse_options(int argc, char** argv, Options* options)
             {
                 return 1;
             }
+        }
+        else if (strcmp(name, "--max-cards") == 0)
+        {
+            if (!parse_number(name, value, 0, 4096, &options->signal_config.max_cards))
+            {
+                return 1;
+            }
+        }
+        else if (strcmp(name, "--public-url") == 0)
+        {
+            // Repeated in pages as is: only a plain http(s) origin.
+            bool ok = value != nullptr && strlen(value) <= BEACON_MAX_PUBLIC_URL &&
+                      (strncmp(value, "https://", 8) == 0 || strncmp(value, "http://", 7) == 0);
+            for (size_t k = 0; ok && value[k] != '\0'; k++)
+            {
+                char c = value[k];
+                ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                     strchr("-.:/[]", c) != nullptr;
+            }
+            if (!ok || value[strlen(value) - 1] == '/')
+            {
+                fprintf(stderr, "beacon: --public-url needs http(s)://host[:port], no path\n");
+                return 1;
+            }
+            snprintf(options->signal_config.public_url, sizeof(options->signal_config.public_url), "%s", value);
         }
         else if (strcmp(name, "--trusted-proxy") == 0)
         {

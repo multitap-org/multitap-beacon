@@ -875,9 +875,195 @@ static void test_guest_rate()
     harness_close(&h);
 }
 
+// One plain HTTP exchange: sends `request` (in two pieces when `split` is
+// set, to cross reads), reads until the server closes.
+static std::string http_exchange(Harness* h, const std::string& request, size_t split)
+{
+    int fd = client_connect(h, 0);
+    if (fd < 0)
+    {
+        return "";
+    }
+    if (split > 0 && split < request.size())
+    {
+        client_send(h, fd, request.substr(0, split));
+        client_send(h, fd, request.substr(split));
+    }
+    else
+    {
+        client_send(h, fd, request);
+    }
+    std::string got;
+    for (int round = 0; round < 2000; round++)
+    {
+        pollfd p = {.fd = fd, .events = POLLIN};
+        if (poll(&p, 1, 0) <= 0)
+        {
+            pump(h, 5);
+            continue;
+        }
+        char buffer[65536];
+        ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+        if (n <= 0)
+        {
+            break;
+        }
+        got.append(buffer, static_cast<size_t>(n));
+    }
+    close(fd);
+    return got;
+}
+
+static std::string http_body(const std::string& response)
+{
+    size_t at = response.find("\r\n\r\n");
+    return at == std::string::npos ? "" : response.substr(at + 4);
+}
+
+static std::string fake_png(uint32_t width, uint32_t height, size_t extra)
+{
+    uint8_t head[33] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R'};
+    for (uint32_t i = 0; i < 4; i++)
+    {
+        head[16 + i] = static_cast<uint8_t>(width >> (24 - 8 * i));
+        head[20 + i] = static_cast<uint8_t>(height >> (24 - 8 * i));
+    }
+    std::string png(reinterpret_cast<const char*>(head), sizeof(head));
+    for (size_t i = 0; i < extra; i++)
+    {
+        png += static_cast<char>(i * 7);
+    }
+    return png;
+}
+
+static std::string card_put(const char* room, const uint8_t key[32], const std::string& title, const std::string& png)
+{
+    std::string body(reinterpret_cast<const char*>(key), 32);
+    body += static_cast<char>(title.size());
+    body += title;
+    body += png;
+    return std::string("POST /join/") + room + "/card HTTP/1.1\r\nHost: beacon.example\r\nContent-Length: " +
+           std::to_string(body.size()) + "\r\n\r\n" + body;
+}
+
+static std::string http_get(const char* method, const std::string& target)
+{
+    return std::string(method) + " " + target + " HTTP/1.1\r\nHost: beacon.example\r\n\r\n";
+}
+
+static void test_http_cards()
+{
+    Harness h;
+    BeaconSignalConfig config = {};
+    config.message_burst = 200;
+    config.max_connections_per_source = 64;
+    check(harness_open(&h, &config), "signaling listener opens");
+
+    // The vector from http_test: token "abcdefghijklmnopqrstuvwxyz".
+    const char* room = "7hqelxhbgx2e3";
+    uint8_t key[32];
+    static const char KEY_HEX[] = "08df115380262124acd5de50e376071f05ef0e65857d278af6e0f52d01b4e1c2";
+    for (uint32_t i = 0; i < 32; i++)
+    {
+        unsigned value = 0;
+        sscanf(KEY_HEX + i * 2, "%2x", &value);
+        key[i] = static_cast<uint8_t>(value);
+    }
+    uint8_t other_key[32];
+    for (uint32_t i = 0; i < 32; i++)
+    {
+        other_key[i] = static_cast<uint8_t>(i);
+    }
+    std::string png = fake_png(640, 480, 100000);
+
+    // Unknown room: the page still opens the app, with a plain card.
+    std::string page = http_exchange(&h, http_get("GET", std::string("/join/") + room), 0);
+    check(page.compare(0, 15, "HTTP/1.1 200 OK") == 0, "the page of an unknown room: 200");
+    check(page.find("A piccolo session") != std::string::npos &&
+              page.find("https://beacon.example/status/_site/v1/img/piccolo-icon-256.png") != std::string::npos,
+          "a plain card, absolute URLs from Host");
+    check(page.find("Content-Type: text/html; charset=utf-8") != std::string::npos &&
+              page.find("X-Robots-Tag: noindex") != std::string::npos,
+          "page headers");
+    check(http_exchange(&h, http_get("GET", std::string("/join/") + room + "/card.png"), 0).compare(0, 12, "HTTP/1.1 404") == 0,
+          "no card yet: 404");
+    check(http_exchange(&h, card_put(room, key, "Zelda", png), 0).compare(0, 12, "HTTP/1.1 404") == 0,
+          "an upload before the room is live: 404");
+
+    // The host holds the guest room: uploads are accepted with the right key.
+    int host = client_open(&h);
+    BeaconSignalingMessage m;
+    m.type = BeaconSignalingType::JOIN;
+    m.role = BeaconRole::GUEST_HOST;
+    beacon_guest_meeting_id(room, &m.room);
+    client_send(&h, host, client_frame(0x82, encode(&m)));
+    BeaconSignalingMessage reply;
+    std::string raw;
+    check(read_message(&h, host, &reply, &raw) && reply.type == BeaconSignalingType::JOINED, "the host's guest room");
+
+    check(http_exchange(&h, card_put(room, other_key, "Zelda", png), 0).compare(0, 12, "HTTP/1.1 403") == 0,
+          "another key for this room: 403");
+    check(http_exchange(&h, card_put("4ecvcngq5gk2z", other_key, "Zelda", png), 0).compare(0, 12, "HTTP/1.1 404") == 0,
+          "a room with no live host: 404");
+    std::string too_big = std::string("POST /join/") + room +
+                          "/card HTTP/1.1\r\nHost: x\r\nContent-Length: " + std::to_string(BEACON_CARD_MAX_UPLOAD + 1) +
+                          "\r\n\r\n";
+    check(http_exchange(&h, too_big, 0).compare(0, 12, "HTTP/1.1 413") == 0, "an upload over the limit: 413");
+    check(http_exchange(&h, card_put(room, key, "", png), 0).compare(0, 12, "HTTP/1.1 400") == 0,
+          "an empty title: 400");
+    std::string put = card_put(room, key, "Zelda <DX>", png);
+    check(http_exchange(&h, put, 120).compare(0, 12, "HTTP/1.1 204") == 0,
+          "the host's card, the body in several reads: 204");
+    check(h.signal.stats.cards == 1, "one card");
+
+    page = http_exchange(&h, http_get("GET", std::string("/join/") + room), 0);
+    check(page.find("<meta property=\"og:title\" content=\"Zelda &lt;DX&gt;\">") != std::string::npos &&
+              page.find("https://beacon.example/join/7hqelxhbgx2e3/card.png") != std::string::npos,
+          "the page carries the card");
+    std::string card = http_exchange(&h, http_get("GET", std::string("/join/") + room + "/card.png"), 0);
+    check(card.find("Content-Type: image/png") != std::string::npos && http_body(card) == png,
+          "the card's PNG, byte for byte (larger than the send buffer)");
+    std::string head = http_exchange(&h, http_get("HEAD", std::string("/join/") + room + "/card.png"), 0);
+    check(head.find("Content-Length: " + std::to_string(png.size())) != std::string::npos && http_body(head).empty(),
+          "HEAD: the length, no body");
+    check(http_exchange(&h, http_get("GET", "/elsewhere"), 0).compare(0, 12, "HTTP/1.1 404") == 0, "other paths: 404");
+    check(http_exchange(&h, http_get("POST", std::string("/join/") + room), 0).compare(0, 12, "HTTP/1.1 404") == 0,
+          "POST to the page: 404");
+
+    // Replacing: four a minute per card (the first put counted).
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        check(http_exchange(&h, card_put(room, key, "Zelda " + std::to_string(i), png), 0).compare(0, 12, "HTTP/1.1 204") == 0,
+              "a replacement within the rate");
+    }
+    check(http_exchange(&h, card_put(room, key, "Zelda 4", png), 0).compare(0, 12, "HTTP/1.1 429") == 0,
+          "the fifth put in a minute: 429");
+    check(strcmp(beacon_signal_card(&h.signal, room)->title, "Zelda 2") == 0, "the last accepted title");
+
+    // The host goes: the card outlives the room for a minute, then it's gone.
+    close(host);
+    pump_a_while(&h);
+    beacon_signal_tick(&h.signal, h.now);
+    h.now += BEACON_CARD_ORPHAN_MS - 1000;
+    beacon_signal_tick(&h.signal, h.now);
+    check(beacon_signal_card(&h.signal, room) != nullptr, "the card waits for the host's reconnect");
+    h.now += 2000;
+    beacon_signal_tick(&h.signal, h.now);
+    check(beacon_signal_card(&h.signal, room) == nullptr && h.signal.stats.cards == 0, "then it's deleted");
+    check(http_exchange(&h, http_get("GET", std::string("/join/") + room + "/card.png"), 0).compare(0, 12, "HTTP/1.1 404") == 0,
+          "and no longer served");
+
+    // WebSockets still work on the same listener.
+    int ws = client_open(&h);
+    check(ws >= 0, "a WebSocket after HTTP");
+    close(ws);
+    harness_close(&h);
+}
+
 int main()
 {
     test_websocket_basics();
+    test_http_cards();
     test_rooms();
     test_guest_rooms();
     test_guest_rate();

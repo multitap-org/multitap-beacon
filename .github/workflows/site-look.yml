@@ -29,7 +29,7 @@ jobs:
           rc=$?
           set -e
           case $rc in
-            0) tools/sync-snippets.sh packaging/status/_site/v1 packaging/status/index.html
+            0) tools/sync-snippets.sh packaging/status/_site/v1 packaging/status/index.html packaging/join/index.html
                echo "changed=true" >> "$GITHUB_OUTPUT" ;;
             2) echo "already current" ;;
             *) echo "::warning::get-piccolo.app/assets/v1 couldn't be fetched" ;;

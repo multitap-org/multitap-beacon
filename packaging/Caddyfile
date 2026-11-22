@@ -15,6 +15,11 @@ beacon.example.org {
         reverse_proxy 127.0.0.1:55432
     }
 
+    # Guest links: the join page, its card, the host's card upload.
+    handle /join/* {
+        reverse_proxy 127.0.0.1:55432
+    }
+
     # The status page (README.md, "Status page"): beacon --status-file
     # /run/beacon/status.json (history.json lands next to it), the page
     # copied to /srv/beacon-status.

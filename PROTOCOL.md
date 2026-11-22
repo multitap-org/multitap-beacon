@@ -157,7 +157,12 @@ SIGNAL, whose blob size is the WebSocket message's size minus 24 (never a field)
 | 20 | LEFT | s->c | 24 | 8 room (16) |
 | 21 | SIGNAL | both | 25-4120 | 8 room (16), 24 blob (1-4096 bytes) |
 | 22 | NOT_FOUND | s->c | 24 | 8 room (16) |
-| 23 | REFUSED | s->c | 28 | 8 room (16), 24 reason (1 = too many rooms on this socket, 2 = room table full), 25 zero (3) |
+| 23 | REFUSED | s->c | 28 | 8 room (16), 24 reason (1 = too many rooms on this socket, 2 = room table full, 3 = guests full, 4 = wrong room kind, 5 = guest JOINs too often), 25 zero (3) |
+| 24 | GUEST_JOINED | s->c | 28 | 8 room (16), 24 guest (0-7), 25 zero (3) |
+| 25 | GUEST_LEFT | s->c | 28 | 8 room (16), 24 guest (0-7), 25 zero (3) |
+| 26 | GUEST_SIGNAL | both | 29-4120 | 8 room (16), 24 guest (0-7), 25 zero (3), 28 blob (1-4092 bytes) |
+
+JOIN's role is 1 = host, 2 = client, 3 = guest room host, 4 = guest (guest rooms below).
 
 - A room holds one host socket and one client socket. **JOIN** puts the socket on its role's
   side and answers JOINED (with whether the other side is there); the other side, if present,
@@ -180,6 +185,69 @@ SIGNAL, whose blob size is the WebSocket message's size minus 24 (never a field)
   authenticates afterwards anyway. (The pairing room, which has no shared key yet, is the one
   plain-text case: see the netcode notes.)
 
+### Guest rooms (guest links)
+
+A piccolo streaming to friends who open a link (piccolo's REMOTE PLAY TOGETHER) meets several
+guests in one room:
+
+- **JOIN role 3** (guest room host) makes the room, or refreshes it (the host's 20 s keepalive).
+  A second host socket replaces the first: the old one gets LEFT, and so does every guest (they
+  start over).
+- **JOIN role 4** (guest) only enters a guest room whose host is there (else NOT_FOUND; a guest
+  never makes a room). The guest gets the first free index (0-7): JOINED (other side present)
+  to the guest, GUEST_JOINED with the index to the host. With 8 guests: REFUSED 3. Guest JOINs
+  that aren't refreshes cost a token: 10 a minute per socket, burst 5 (REFUSED 5).
+- A guest's **SIGNAL** reaches the host as **GUEST_SIGNAL** with the guest's index; the host's
+  GUEST_SIGNAL reaches that guest as SIGNAL. A guest's blob is at most 4092 bytes (it must fit
+  with the index): a larger one closes the guest's socket (1009). A GUEST_SIGNAL to an index
+  nobody holds gets the host a GUEST_LEFT. The host's plain SIGNAL in a guest room gets
+  NOT_FOUND.
+- A guest leaving (LEAVE or its socket closing): GUEST_LEFT to the host. The host leaving ends
+  the room: every guest gets LEFT.
+- Roles 1 / 2 on a guest room, and 3 / 4 on a plain room: REFUSED 4.
+- Guests use the same blob sealing as everyone, with a key from the link's token (below), which
+  beacon never sees.
+
+### Guest links: the join page and its card
+
+Besides WebSocket, the same listener answers a few plain HTTP/1.1 requests (no Upgrade header):
+
+| request | answer |
+|---|---|
+| GET or HEAD `/join/<room>` | the join page (HTML): opens piccoletto, with og:title / og:image for chat apps |
+| GET or HEAD `/join/<room>/card.png` | the card's PNG, or 404 |
+| POST `/join/<room>/card` | 204, or 400 / 403 / 404 / 413 / 429 / 503 |
+
+- A link is `https://<beacon>/join/<room>#<token>`. The token (26 base32 characters, 130 bits)
+  is after the `#`: browsers never send it, so beacon never sees it. From it (BLAKE2b, `||` is
+  concatenation, the prefixes are their ASCII bytes):
+  - card key = BLAKE2b-256("multitap guest card v1" || token), the host's proof for the card;
+  - room = the first 13 lowercase base32 characters (RFC 4648 alphabet, 65 bits) of
+    BLAKE2b-256("multitap guest room v1" || card key): the link's `<room>`;
+  - meeting id = BLAKE2b-128("multitap guest v1" || room): the guest room (signaling) and the
+    UDP meeting id;
+  - signaling key = BLAKE2b-256("multitap guest signal v1" || token): the blobs' sealing key.
+  So beacon can check a card upload against the room without the token, and nobody can put a
+  card on someone else's room.
+- The upload's body (Content-Length, at most 256 KiB + 97): card key (32), title length (1),
+  title (1-64 bytes of UTF-8, no control characters), then a PNG (at most 256 KiB, 1280 x 960:
+  its signature and IHDR are checked, nothing else is read). Accepted only while the room's
+  host is in its guest room (404 otherwise, checked before the body is read and again after);
+  a card key that doesn't hash to the room: 403. One card per room; replacing it 4 times a
+  minute at most (429).
+- The page is the same for everyone; its title and image are the card's (escaped), or a plain
+  "A piccolo session" with the piccolo icon. Its script reads the token from the `#` and offers
+  piccoletto: on Android an `intent://join/<room>?t=<token>` with piccoletto in the browser as
+  the fallback, elsewhere piccoletto in the browser
+  (`https://get-piccolo.app/play/piccoletto/#join=<room>.<token>`; `&b=<host>` is added for a
+  beacon other than beacon.get-piccolo.app). The page sends nothing.
+- Cards live in memory only (64 by default, `--max-cards`), and are deleted 60 s after their
+  guest room ends (the grace covers a host's reconnect). A card being sent when it's replaced
+  or deleted is cut off (the connection closes).
+- Strict subset: one request per connection (`Connection: close`), heads up to 4 KiB, no
+  chunked bodies, no body on GET. Uploads and pages take a slot from small pools (4 and 32 by
+  default): with none free, 503. 20 s to send an upload's body, 30 s to read a response.
+
 ### Limits
 
 Per socket: 64 rooms; 20 messages per second (burst 60) and 16 KiB per second (burst 64 KiB);
@@ -195,8 +263,10 @@ header to the client's address (it ignores what clients send unless told to trus
 - The server never parses anything variable: every message is a fixed struct, checked field by
   field. Fuzzed (libFuzzer) with a decode -> encode round-trip check. The exceptions, each
   fuzzed on its own: STUN's attribute list (only walked to check that it fits), the WebSocket
-  handshake (HTTP headers, at most 4 KiB, strict) and frames, and SIGNAL's blob (never read:
-  its length comes from the frame, capped at 4096).
+  handshake (HTTP headers, at most 4 KiB, strict) and frames, SIGNAL's blob (never read:
+  its length comes from the frame, capped at 4096), and the guest links' HTTP requests and
+  card uploads (fuzzed: request heads, the upload's fields, the PNG's IHDR; the rest of the
+  PNG is never read, only served back with nosniff).
 - The server is not authenticated in v1 (phase 2: signed directory). A spoofed INTRO can at
   most make a peer send PUNCHes (32 bytes, 50 of them) to some address, and only for an id the
   peer has registered or asked for.

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>{{TITLE}}: join on piccolo</title>
+<meta name="description" content="{{DESCRIPTION}}">
+<!-- The card chat apps show for the link (guest links, PROTOCOL.md). -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="piccolo">
+<meta property="og:title" content="{{TITLE}}">
+<meta property="og:description" content="{{DESCRIPTION}}">
+<meta property="og:image" content="{{IMAGE}}">
+<meta property="og:url" content="{{URL}}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#1A2840">
+<link rel="icon" href="/status/_site/v1/img/piccolo-icon-small.svg" type="image/svg+xml">
+<!-- The sites' shared look: the status page's copy on this same server. -->
+<link rel="stylesheet" href="/status/_site/v1/site.css">
+<style>
+  main.wrap { padding-top: 40px; padding-bottom: 48px; display: grid; gap: 24px; max-width: 760px; }
+  h1 { margin: 0; }
+  .lede { margin: -8px 0 0; color: var(--muted); }
+  .shot { display: block; width: 100%; height: auto; image-rendering: pixelated; background: #000; }
+  .actions { display: flex; flex-wrap: wrap; gap: 14px; }
+  .join { padding: 20px 22px; display: grid; gap: 16px; }
+  .join p { margin: 0; color: var(--muted); }
+  .bad { padding: 20px 22px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body data-site="play">
+<!-- sites-header (tools/sync-snippets.sh) -->
+<header class="sites-bar">
+  <div class="wrap sites-bar-row">
+    <a class="sites-brand" href="https://get-piccolo.app/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="12" fill="#1A2840"/><rect x="8" y="26" width="24" height="10" fill="#E0E6F0"/><rect x="15" y="19" width="10" height="24" fill="#E0E6F0"/><circle cx="43" cy="38" r="7" fill="#FFC93C"/><circle cx="53" cy="26" r="7" fill="#E0E6F0"/></svg> piccolo</a>
+    <nav class="sites-nav" aria-label="piccolo's sites">
+      <a data-site="home" href="https://get-piccolo.app/">Home</a>
+      <a data-site="play" href="https://get-piccolo.app/play/">Play</a>
+      <a data-site="cores" href="https://cores.get-piccolo.app/cores/">Cores</a>
+      <a data-site="releases" href="https://releases.get-piccolo.app/">Releases</a>
+      <a data-site="status" href="https://beacon.get-piccolo.app/status/">Status</a>
+      <a href="https://github.com/multitap-org/piccolo">GitHub</a>
+    </nav>
+  </div>
+</header>
+<!-- /sites-header -->
+<main class="wrap">
+  <h1>{{TITLE}}</h1>
+  <p class="lede">{{DESCRIPTION}}</p>
+  <img class="shot" id="shot" src="{{IMAGE}}" alt="" onerror="this.hidden = true">
+  <section class="panel join" id="ok" hidden>
+    <div class="actions">
+      <a class="btn primary" id="android" href="#" hidden>Open in piccoletto</a>
+      <a class="btn" id="web" href="#">Play in the browser</a>
+    </div>
+    <p>piccoletto is piccolo's companion app: you watch the game, and play when the host gave you a seat
+      and a controller port is free. Nothing to sign up for, and nothing is kept once the session ends.</p>
+    <p>If it says it couldn't connect, your network and the host's can't reach each other directly
+      (the beacon only introduces you, it never relays the game).</p>
+  </section>
+  <section class="panel bad" id="bad" hidden>
+    <p>This link is missing its key (the part after the #). Copy the whole link again.</p>
+  </section>
+</main>
+<!-- sites-footer (tools/sync-snippets.sh) -->
+<footer class="sites-foot">
+  <div class="wrap sites-foot-row">
+    <p>piccolo is free software (MIT), part of the <a href="https://github.com/multitap-org">Multitap</a> project.</p>
+    <p class="sites-foot-links"><a href="https://get-piccolo.app/">Home</a> <a href="https://get-piccolo.app/play/">Play</a> <a href="https://cores.get-piccolo.app/cores/">Cores</a> <a href="https://releases.get-piccolo.app/">Releases</a> <a href="https://beacon.get-piccolo.app/status/">Status</a> <a href="https://github.com/multitap-org/piccolo">GitHub</a> <a href="https://github.com/multitap-org/piccolo/issues">Issues</a></p>
+  </div>
+</footer>
+<!-- /sites-footer -->
+<script>
+"use strict";
+// The room comes from the path, the token from the part after the # (it never
+// reaches a server, this one included). Nothing is sent from here.
+const PICCOLETTO_WEB = "https://get-piccolo.app/play/piccoletto/";
+const DEFAULT_BEACON = "beacon.get-piccolo.app";
+
+function readLink() {
+  const path = /^\/join\/([a-z2-7]{13})\/?$/.exec(location.pathname);
+  const hash = /^#([a-z2-7]{26})$/.exec(location.hash);
+  if (path === null || hash === null) {
+    return null;
+  }
+  // A beacon other than the default travels with the link.
+  const beacon = location.host === DEFAULT_BEACON ? "" : location.host;
+  return { room: path[1], token: hash[1], beacon: beacon };
+}
+
+function show() {
+  const link = readLink();
+  document.getElementById("ok").hidden = link === null;
+  document.getElementById("bad").hidden = link !== null;
+  if (link === null) {
+    return;
+  }
+  const beacon = link.beacon === "" ? "" : "&b=" + encodeURIComponent(link.beacon);
+  const web = PICCOLETTO_WEB + "#join=" + link.room + "." + link.token + beacon;
+  document.getElementById("web").href = web;
+  if (/Android/i.test(navigator.userAgent)) {
+    // The app if it's installed, else Chrome opens the fallback: piccoletto
+    // in the browser.
+    const intent = "intent://join/" + link.room + "?t=" + link.token + beacon +
+      "#Intent;scheme=piccoletto;package=site.multitap.piccoletto;S.browser_fallback_url=" +
+      encodeURIComponent(web) + ";end";
+    const android = document.getElementById("android");
+    android.href = intent;
+    android.hidden = false;
+    document.getElementById("web").classList.remove("primary");
+  } else {
+    document.getElementById("web").classList.add("primary");
+  }
+}
+
+show();
+window.addEventListener("hashchange", show);
+</script>
+</body>
+</html>
