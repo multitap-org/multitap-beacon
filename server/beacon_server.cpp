@@ -434,6 +434,27 @@ static void handle_register(BeaconServer* server, uint64_t now_ms, const BeaconA
     outbox_add(out, BeaconSocket::PRIMARY, from, &reply);
 }
 
+// PRESENCE: which of these ids are registered now (either family). Nothing
+// is stored and nobody is told: lists show paired hosts online / offline
+// without starting a meeting. The reply is smaller than the request.
+static void handle_presence(BeaconServer* server, uint64_t now_ms, const BeaconAddress* from,
+                            const BeaconMessage* request, BeaconOutbox* out)
+{
+    server->stats.presences++;
+    BeaconMessage reply = {};
+    reply.type = BeaconType::PRESENT;
+    reply.nonce = request->nonce;
+    for (uint32_t i = 0; i < request->id_count; i++)
+    {
+        if (entry_scan(server, now_ms, &request->ids[i], 1, nullptr) != NO_SLOT ||
+            entry_scan(server, now_ms, &request->ids[i], 0, nullptr) != NO_SLOT)
+        {
+            reply.present = static_cast<uint8_t>(reply.present | (1u << i));
+        }
+    }
+    outbox_add(out, BeaconSocket::PRIMARY, from, &reply);
+}
+
 static void handle_meet(BeaconServer* server, uint64_t now_ms, const BeaconAddress* from,
                         const BeaconMessage* request, BeaconOutbox* out)
 {
@@ -560,7 +581,8 @@ void beacon_server_receive(BeaconServer* server, uint64_t now_ms, BeaconSocket s
 
     bool request_type = (socket != BeaconSocket::STUN && request.type == BeaconType::BIND) ||
                         (socket == BeaconSocket::PRIMARY &&
-                         (request.type == BeaconType::REGISTER || request.type == BeaconType::MEET));
+                         (request.type == BeaconType::REGISTER || request.type == BeaconType::MEET ||
+                          request.type == BeaconType::PRESENCE));
     if (!request_type)
     {
         server->stats.unexpected++;
@@ -583,6 +605,9 @@ void beacon_server_receive(BeaconServer* server, uint64_t now_ms, BeaconSocket s
             break;
         case BeaconType::MEET:
             handle_meet(server, now_ms, from, &request, out);
+            break;
+        case BeaconType::PRESENCE:
+            handle_presence(server, now_ms, from, &request, out);
             break;
         default:
             break;

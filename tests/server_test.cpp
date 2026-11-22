@@ -141,6 +141,33 @@ static int32_t register_ids(Fixture* f, const BeaconAddress* host, uint32_t firs
     return r.id_count;
 }
 
+// PRESENCE: which ids are registered, without a meeting (lists' ONLINE / OFFLINE).
+static void test_presence()
+{
+    Fixture f;
+    BeaconServerConfig config = {};
+    check(fixture_create(&f, &config), "server creates");
+    BeaconAddress host = ipv4(203, 0, 113, 1, 40000);
+    BeaconAddress client = ipv4(198, 51, 100, 2, 50000);
+    check(register_ids(&f, &host, 100, 2, nullptr) == 2, "two ids registered");
+    BeaconMessage m = {};
+    m.type = BeaconType::PRESENCE;
+    m.nonce = 77;
+    m.id_count = 3;
+    m.ids[0] = make_id(101);
+    m.ids[1] = make_id(555);
+    m.ids[2] = make_id(100);
+    send_message(&f, BeaconSocket::PRIMARY, &client, &m);
+    BeaconMessage r;
+    check(f.out.count == 1 && reply(&f, 0, &r) && r.type == BeaconType::PRESENT && r.nonce == 77,
+          "PRESENCE gets one PRESENT");
+    check(r.present == 0x05, "bits for the registered ids only (0 and 2)");
+    check(f.server.stats.presences == 1 && f.server.stats.intros == 0, "counted, and nobody was introduced");
+    send_message(&f, BeaconSocket::SECONDARY, &client, &m);
+    check(f.out.count == 0, "only on the primary socket");
+    beacon_server_destroy(&f.server);
+}
+
 static void test_bind()
 {
     Fixture f;
@@ -700,6 +727,7 @@ int main()
 {
     test_bind();
     test_register_and_meet();
+    test_presence();
     test_expiry_and_cookie_age();
     test_limits();
     test_rate_limit();
