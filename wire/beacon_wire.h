@@ -32,6 +32,8 @@ constexpr uint32_t BEACON_SIZE_MEET = 52;
 constexpr uint32_t BEACON_SIZE_INTRO = 52;
 constexpr uint32_t BEACON_SIZE_NOT_FOUND = 32;
 constexpr uint32_t BEACON_SIZE_PUNCH = 32;
+constexpr uint32_t BEACON_SIZE_PRESENCE = 148;
+constexpr uint32_t BEACON_SIZE_PRESENT = 20;
 constexpr uint32_t BEACON_MAX_MESSAGE_SIZE = 164;
 
 // Anti-amplification (PROTOCOL.md): a reply is never larger than its request.
@@ -40,6 +42,7 @@ static_assert(BEACON_SIZE_COOKIE <= BEACON_SIZE_REGISTER, "COOKIE must not be la
 static_assert(BEACON_SIZE_REGISTERED <= BEACON_SIZE_REGISTER, "REGISTERED must not be larger than REGISTER");
 static_assert(BEACON_SIZE_INTRO <= BEACON_SIZE_MEET, "INTRO must not be larger than MEET");
 static_assert(BEACON_SIZE_NOT_FOUND <= BEACON_SIZE_MEET, "NOT_FOUND must not be larger than MEET");
+static_assert(BEACON_SIZE_PRESENT <= BEACON_SIZE_PRESENCE, "PRESENT must not be larger than PRESENCE");
 
 enum class BeaconType : uint8_t
 {
@@ -52,6 +55,8 @@ enum class BeaconType : uint8_t
     INTRO = 7,
     NOT_FOUND = 8,
     PUNCH = 9,
+    PRESENCE = 10,   // c->s: which of these meeting ids are registered now? (online / offline in lists)
+    PRESENT = 11,    // s->c: one bit per id asked
 };
 
 // An address as the protocol carries it: IPv6 bytes in network order (IPv4 as
@@ -74,9 +79,10 @@ struct BeaconMessage
     BeaconType type = BeaconType::BIND;
     uint64_t nonce = 0;                            // every type
     uint8_t cookie[BEACON_COOKIE_SIZE] = {};   // REGISTER, COOKIE, REGISTERED
-    uint8_t id_count = 0;                          // REGISTER: count (1-8); REGISTERED: accepted (0-8)
+    uint8_t id_count = 0;                          // REGISTER, PRESENCE: count (1-8); REGISTERED: accepted (0-8)
+    uint8_t present = 0;                           // PRESENT: bit i = ids[i] of the PRESENCE is registered
     uint16_t ttl_seconds = 0;                      // REGISTERED
-    BeaconId ids[BEACON_MAX_IDS] = {};     // REGISTER: ids[0, count); MEET, INTRO, NOT_FOUND, PUNCH: ids[0]
+    BeaconId ids[BEACON_MAX_IDS] = {};     // REGISTER, PRESENCE: ids[0, count); MEET, INTRO, NOT_FOUND, PUNCH: ids[0]
     BeaconAddress address = {};                // BOUND, INTRO
 };
 

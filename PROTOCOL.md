@@ -53,14 +53,21 @@ Offsets count from the start of the packet (the header is bytes 0-7).
 | 7 | INTRO | s->both | 52 | 8 nonce (the MEET's), 16 meeting id (16), 32 the other side's address (20) |
 | 8 | NOT_FOUND | s->c | 32 | 8 nonce, 16 meeting id (16) |
 | 9 | PUNCH | peer<->peer | 32 | 8 nonce (the MEET's), 16 meeting id (16) |
+| 10 | PRESENCE | c->s | 148 | 8 nonce, 16 count 1-8, 17 zero (3), 20 ids[8] (16 each) |
+| 11 | PRESENT | s->c | 20 | 8 nonce (the PRESENCE's), 16 bits (bit i = ids[i] is registered), 17 zero (3) |
 
-Field rules: REGISTER's ids `[0, count)` are non-zero and the ids from `count` on are all zero;
+Field rules: REGISTER's and PRESENCE's ids `[0, count)` are non-zero and the ids from `count` on are all zero;
 REGISTERED's accepted is 0-8; every address has a non-zero port and zero padding.
 
 - **Meeting id** (computed by the peers, opaque to the server): first 16 bytes of
   BLAKE2b("multitap beacon v1" || X25519(own static, other's static)). Both sides of a
   pairing compute the same id; the server can't link it to keys or devices. (An all-zero
   result is astronomically unlikely; if it happens, that pairing just can't use beacon.)
+- **PRESENCE** (2026-11-22): a client asks which of up to 8 meeting ids are registered now (either
+  family), to show its paired hosts ONLINE / OFFLINE without starting a meeting. Nothing is
+  stored and nobody is told; PRESENT is smaller than PRESENCE. Primary socket only, under the same
+  per-source rate limit as REGISTER and MEET. Anyone who knows a meeting id can ask, and ids are
+  secret.
 - **REGISTER** comes from the host's ENet socket (so the stored address is that socket's NAT
   mapping): one per 8 paired devices, every 20 s (this also keeps the mapping alive).
   - Cookie zero or not valid: the server answers COOKIE only and stores nothing. The host

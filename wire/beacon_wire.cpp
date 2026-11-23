@@ -22,6 +22,15 @@ static constexpr uint32_t OFFSET_REGISTERED_ACCEPTED = 32;
 static constexpr uint32_t OFFSET_REGISTERED_PAD = 33;
 static constexpr uint32_t OFFSET_REGISTERED_TTL = 34;
 
+// PRESENCE / PRESENT
+static constexpr uint32_t OFFSET_PRESENCE_COUNT = 16;
+static constexpr uint32_t OFFSET_PRESENCE_PAD = 17;
+static constexpr uint32_t OFFSET_PRESENCE_IDS = 20;
+static constexpr uint32_t OFFSET_PRESENT_BITS = 16;
+static constexpr uint32_t OFFSET_PRESENT_PAD = 17;
+static_assert(OFFSET_PRESENCE_IDS + BEACON_MAX_IDS * BEACON_ID_SIZE == BEACON_SIZE_PRESENCE, "PRESENCE layout");
+static_assert(OFFSET_PRESENT_PAD + 3 == BEACON_SIZE_PRESENT, "PRESENT layout");
+
 static_assert(OFFSET_REGISTER_IDS + BEACON_MAX_IDS * BEACON_ID_SIZE == BEACON_SIZE_REGISTER,
               "REGISTER layout");
 static_assert(OFFSET_REGISTERED_TTL + 2 == BEACON_SIZE_REGISTERED, "REGISTERED layout");
@@ -131,6 +140,10 @@ uint32_t beacon_message_size(uint8_t type)
             return BEACON_SIZE_NOT_FOUND;
         case static_cast<uint8_t>(BeaconType::PUNCH):
             return BEACON_SIZE_PUNCH;
+        case static_cast<uint8_t>(BeaconType::PRESENCE):
+            return BEACON_SIZE_PRESENCE;
+        case static_cast<uint8_t>(BeaconType::PRESENT):
+            return BEACON_SIZE_PRESENT;
         default:
             return 0;
     }
@@ -212,6 +225,55 @@ static bool decode_cookie(const uint8_t* p, BeaconMessage* out)
 {
     out->nonce = read_u64(p + OFFSET_NONCE);
     memcpy(out->cookie, p + OFFSET_AFTER_NONCE, BEACON_COOKIE_SIZE);
+    return true;
+}
+
+// ids [0, count) non-zero, the rest zero (REGISTER's rule).
+static bool decode_ids(const uint8_t* p, uint8_t count, BeaconMessage* out)
+{
+    if (count < 1 || count > BEACON_MAX_IDS)
+    {
+        return false;
+    }
+    out->id_count = count;
+    for (uint32_t i = 0; i < BEACON_MAX_IDS; i++)
+    {
+        const uint8_t* id = p + i * BEACON_ID_SIZE;
+        bool zero = all_zero(id, BEACON_ID_SIZE);
+        if (i < count)
+        {
+            if (zero)
+            {
+                return false;
+            }
+            memcpy(out->ids[i].bytes, id, BEACON_ID_SIZE);
+        }
+        else if (!zero)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool decode_presence(const uint8_t* p, BeaconMessage* out)
+{
+    out->nonce = read_u64(p + OFFSET_NONCE);
+    if (!all_zero(p + OFFSET_PRESENCE_PAD, 3))
+    {
+        return false;
+    }
+    return decode_ids(p + OFFSET_PRESENCE_IDS, p[OFFSET_PRESENCE_COUNT], out);
+}
+
+static bool decode_present(const uint8_t* p, BeaconMessage* out)
+{
+    out->nonce = read_u64(p + OFFSET_NONCE);
+    if (!all_zero(p + OFFSET_PRESENT_PAD, 3))
+    {
+        return false;
+    }
+    out->present = p[OFFSET_PRESENT_BITS];
     return true;
 }
 
@@ -301,6 +363,12 @@ bool beacon_decode(const uint8_t* data, size_t size, BeaconMessage* out)
         case BeaconType::PUNCH:
             ok = decode_nonce_and_id(data, out);
             break;
+        case BeaconType::PRESENCE:
+            ok = decode_presence(data, out);
+            break;
+        case BeaconType::PRESENT:
+            ok = decode_present(data, out);
+            break;
     }
     if (!ok)
     {
@@ -322,7 +390,10 @@ static bool message_valid(const BeaconMessage* m)
             return true;
         case BeaconType::BOUND:
             return address_valid(&m->address);
+        case BeaconType::PRESENT:
+            return true;
         case BeaconType::REGISTER:
+        case BeaconType::PRESENCE:
             if (m->id_count < 1 || m->id_count > BEACON_MAX_IDS)
             {
                 return false;
@@ -390,6 +461,16 @@ uint32_t beacon_encode(const BeaconMessage* message, uint8_t* out, size_t capaci
         case BeaconType::INTRO:
             memcpy(out + OFFSET_AFTER_NONCE, message->ids[0].bytes, BEACON_ID_SIZE);
             write_address(out + OFFSET_AFTER_16, &message->address);
+            break;
+        case BeaconType::PRESENCE:
+            out[OFFSET_PRESENCE_COUNT] = message->id_count;
+            for (uint32_t i = 0; i < message->id_count; i++)
+            {
+                memcpy(out + OFFSET_PRESENCE_IDS + i * BEACON_ID_SIZE, message->ids[i].bytes, BEACON_ID_SIZE);
+            }
+            break;
+        case BeaconType::PRESENT:
+            out[OFFSET_PRESENT_BITS] = message->present;
             break;
     }
     return size;

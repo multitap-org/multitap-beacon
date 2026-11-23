@@ -95,6 +95,7 @@ struct BeaconStats
     uint64_t ids_refused_source = 0; // over max_ids_per_source
     uint64_t ids_refused_full = 0;   // table full (max_entries or no free slot)
     uint64_t meets = 0;
+    uint64_t presences = 0;     // PRESENCE queries answered
     uint64_t intros = 0;             // MEETs answered with INTRO (two packets each)
     uint64_t intro_limited = 0;
     uint64_t not_found = 0;
