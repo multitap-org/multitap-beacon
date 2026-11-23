@@ -107,8 +107,13 @@
         talk to sees, and one anonymous meeting id per paired device, a hash the beacon can't tie to a device,
         a key or a person. Each is forgotten 60 seconds after the piccolo stops refreshing it.</dd>
       <dt>What it keeps</dt>
-      <dd>Only the counts on this page: how many piccolos are online and how many introductions it made.
+      <dd>The beacon itself keeps only the counts on this page: how many piccolos are online and how many introductions it made.
         No accounts, no names, no addresses, no ids, nothing on disk but those counts.</dd>
+      <dt>The web server in front</dt>
+      <dd>This page, and the WebSocket connection used to meet over WebRTC (a browser, for example), go through
+        an ordinary web server that keeps the usual access log of any website: the visitor's address, the time
+        and what was asked for. That log belongs to the web server, not to the beacon. Introductions over UDP
+        don't go through it.</dd>
       <dt>Who runs it</dt>
       <dd>The Multitap project runs this one. It's free software (MIT): read the code or run your own on
         <a href="https://github.com/multitap-org/multitap-beacon">GitHub</a>.</dd>
