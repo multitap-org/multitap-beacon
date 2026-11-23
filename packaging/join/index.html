@@ -14,6 +14,11 @@
 <meta property="og:title" content="{{TITLE}}">
 <meta property="og:description" content="{{DESCRIPTION}}">
 <meta property="og:image" content="{{IMAGE}}">
+<meta property="og:image:secure_url" content="{{IMAGE}}">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="{{IMAGE_WIDTH}}">
+<meta property="og:image:height" content="{{IMAGE_HEIGHT}}">
+<meta name="twitter:image" content="{{IMAGE}}">
 <meta property="og:url" content="{{URL}}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#1A2840">
@@ -25,6 +30,7 @@
   h1 { margin: 0; }
   .lede { margin: -8px 0 0; color: var(--muted); }
   .shot { display: block; width: 100%; height: auto; image-rendering: pixelated; background: #000; }
+  canvas.shot { aspect-ratio: 4 / 3; }
   .actions { display: flex; flex-wrap: wrap; gap: 14px; }
   .join { padding: 20px 22px; display: grid; gap: 16px; }
   .join p { margin: 0; color: var(--muted); }
@@ -51,7 +57,7 @@
 <main class="wrap">
   <h1>{{TITLE}}</h1>
   <p class="lede">{{DESCRIPTION}}</p>
-  <img class="shot" id="shot" src="{{IMAGE}}" alt="" onerror="this.hidden = true">
+  <img class="shot" id="shot" src="{{IMAGE}}" alt="" onerror="noise()">
   <section class="panel join" id="ok" hidden>
     <div class="actions">
       <a class="btn primary" id="android" href="#" hidden>Open in piccoletto</a>
@@ -117,6 +123,42 @@ function show() {
   }
 }
 
+// No screenshot (the beacon gave the white noise picture, or the picture
+// didn't load): live TV static instead, drawn here.
+function noise() {
+  const shot = document.getElementById("shot");
+  if (shot === null || shot.tagName === "CANVAS") {
+    return;
+  }
+  const canvas = document.createElement("canvas");
+  canvas.className = "shot";
+  canvas.id = "shot";
+  canvas.width = 160;
+  canvas.height = 120;
+  shot.replaceWith(canvas);
+  const context = canvas.getContext("2d");
+  const frame = context.createImageData(canvas.width, canvas.height);
+  let last = 0;
+  function draw(now) {
+    if (now - last > 66) {   // about 15 frames a second, like a tuner
+      last = now;
+      for (let i = 0; i < frame.data.length; i += 4) {
+        const gray = 20 + Math.floor(Math.random() * 16) * 14;
+        frame.data[i] = gray;
+        frame.data[i + 1] = gray;
+        frame.data[i + 2] = gray;
+        frame.data[i + 3] = 255;
+      }
+      context.putImageData(frame, 0, 0);
+    }
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+}
+
+if (/\/join\/noise\.png$/.test(document.getElementById("shot").src)) {
+  noise();
+}
 show();
 window.addEventListener("hashchange", show);
 </script>

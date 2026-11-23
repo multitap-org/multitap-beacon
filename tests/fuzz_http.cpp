@@ -35,10 +35,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     BeaconCardUpload upload;
     if (beacon_card_parse_upload(data, size, &upload))
     {
-        if (upload.png < data || upload.png + upload.png_size != data + size || upload.png_size > BEACON_CARD_MAX_PNG ||
-            upload.width == 0 || upload.width > BEACON_CARD_MAX_WIDTH || upload.height == 0 ||
-            upload.height > BEACON_CARD_MAX_HEIGHT || strlen(upload.title) == 0 ||
-            strlen(upload.title) > BEACON_CARD_MAX_TITLE)
+        bool picture_ok = upload.png == nullptr
+                              ? upload.png_size == 0 && upload.width == 0 && upload.height == 0
+                              : upload.png >= data && upload.png + upload.png_size == data + size &&
+                                    upload.png_size <= BEACON_CARD_MAX_PNG && upload.width > 0 &&
+                                    upload.width <= BEACON_CARD_MAX_WIDTH && upload.height > 0 &&
+                                    upload.height <= BEACON_CARD_MAX_HEIGHT;
+        if (!picture_ok || strlen(upload.title) == 0 || strlen(upload.title) > BEACON_CARD_MAX_TITLE)
         {
             abort();
         }

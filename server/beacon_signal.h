@@ -116,6 +116,7 @@ enum class BeaconBodyKind : uint8_t
     NONE,
     PAGE,           // a page slot
     CARD,           // a card's PNG (dropped if the card changes meanwhile)
+    NOISE,          // the white noise PNG (compiled in)
 };
 
 struct BeaconConnection
@@ -170,7 +171,9 @@ struct BeaconCard
     char room[BEACON_GUEST_ROOM_SIZE + 1] = {};
     BeaconId meeting = {};                  // the guest room it belongs to
     char title[BEACON_CARD_MAX_TITLE + 1] = {};
-    uint32_t png_size = 0;                  // the PNG: card_data[index * BEACON_CARD_MAX_PNG, + png_size)
+    uint32_t png_size = 0;                  // the PNG: card_data[index * BEACON_CARD_MAX_PNG, + png_size); 0 = none
+    uint32_t width = 0;                     // its size (the page's og:image:width / height)
+    uint32_t height = 0;
     uint32_t generation = 0;                // bumped when replaced or deleted
     uint64_t orphan_since_ms = 0;           // its guest room is gone since (0: it's live)
     uint64_t puts_last_ms = 0;

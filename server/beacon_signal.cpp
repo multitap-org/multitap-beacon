@@ -483,6 +483,11 @@ static bool refill_body(BeaconSignal* signal, BeaconConnection* connection)
     {
         source = signal->page_data.data() + static_cast<size_t>(connection->body_index) * BEACON_HTTP_PAGE_SIZE;
     }
+    else if (connection->body_kind == BeaconBodyKind::NOISE)
+    {
+        size_t noise_size = 0;
+        source = beacon_join_noise(&noise_size);
+    }
     else
     {
         const BeaconCard* card = &signal->cards[connection->body_index];
@@ -1089,20 +1094,33 @@ static void http_page(BeaconSignal* signal, uint32_t index, const BeaconHttpRequ
     char url[sizeof(base) + 64];
     snprintf(url, sizeof(url), "%s/join/%s", base, connection->route.room);
     uint32_t card = card_find(signal, connection->route.room);
-    const char* title = "A piccolo session";
+    BeaconJoinPage shown;
+    shown.title = "A piccolo session";
+    shown.page_url = url;
+    shown.image_url = image;
+    shown.image_width = BEACON_NOISE_WIDTH;
+    shown.image_height = BEACON_NOISE_HEIGHT;
+    // White noise when there's no screenshot (Andrés).
+    snprintf(image, sizeof(image), "%s/join/noise.png", base);
+    char description[256];
+    snprintf(description, sizeof(description), "%s",
+             "Join this game on piccolo: watch it, and play when a seat is free.");
     if (card != BEACON_SIGNAL_NONE)
     {
-        title = signal->cards[card].title;
-        snprintf(image, sizeof(image), "%s/join/%s/card.png", base, connection->route.room);
+        const BeaconCard* found = &signal->cards[card];
+        shown.title = found->title;
+        snprintf(description, sizeof(description),
+                 "Playing %s on piccolo. Join: watch it, and play when a seat is free.", found->title);
+        if (found->png_size > 0)
+        {
+            snprintf(image, sizeof(image), "%s/join/%s/card.png", base, connection->route.room);
+            shown.image_width = found->width;
+            shown.image_height = found->height;
+        }
     }
-    else
-    {
-        snprintf(image, sizeof(image), "%s/status/_site/v1/img/piccolo-icon-256.png", base);
-    }
-    static const char DESCRIPTION[] = "Join this game on piccolo: watch it, and play when a seat is free.";
+    shown.description = description;
     char* page = reinterpret_cast<char*>(signal->page_data.data() + static_cast<size_t>(slot) * BEACON_HTTP_PAGE_SIZE);
-    size_t size = beacon_join_page_render(beacon_join_page_builtin(), title, DESCRIPTION, image, url, page,
-                                          BEACON_HTTP_PAGE_SIZE);
+    size_t size = beacon_join_page_render(beacon_join_page_builtin(), &shown, page, BEACON_HTTP_PAGE_SIZE);
     if (size == 0)
     {
         signal->page_used[slot] = 0;
@@ -1126,7 +1144,7 @@ static void http_card_png(BeaconSignal* signal, uint32_t index, const BeaconHttp
 {
     BeaconConnection* connection = &signal->connections[index];
     uint32_t card = card_find(signal, connection->route.room);
-    if (card == BEACON_SIGNAL_NONE)
+    if (card == BEACON_SIGNAL_NONE || signal->cards[card].png_size == 0)
     {
         http_answer(signal, connection, 404, now_ms);
         return;
@@ -1141,6 +1159,25 @@ static void http_card_png(BeaconSignal* signal, uint32_t index, const BeaconHttp
     connection->body_generation = signal->cards[card].generation;
     connection->body_offset = 0;
     connection->body_size = request->method == BeaconHttpMethod::HEAD ? 0 : signal->cards[card].png_size;
+    connection->state = BeaconConnectionState::CLOSING;
+    connection->deadline_ms = now_ms + BEACON_HTTP_SEND_MS;
+    connection->receive_used = 0;
+}
+
+// The white noise PNG: small enough for the send buffer at once.
+static void http_noise(BeaconSignal* signal, uint32_t index, const BeaconHttpRequest* request, uint64_t now_ms)
+{
+    BeaconConnection* connection = &signal->connections[index];
+    size_t size = 0;
+    beacon_join_noise(&size);   // its size; refill_body copies it
+    char head[512];
+    size_t head_size = beacon_http_response_head(200, "image/png", "Cache-Control: public, max-age=86400\r\n", size,
+                                                 head, sizeof(head));
+    connection->send_used = 0;
+    queue_bytes(connection, reinterpret_cast<const uint8_t*>(head), head_size);
+    connection->body_kind = BeaconBodyKind::NOISE;
+    connection->body_offset = 0;
+    connection->body_size = request->method == BeaconHttpMethod::HEAD ? 0 : static_cast<uint32_t>(size);
     connection->state = BeaconConnectionState::CLOSING;
     connection->deadline_ms = now_ms + BEACON_HTTP_SEND_MS;
     connection->receive_used = 0;
@@ -1211,9 +1248,14 @@ static void http_upload_done(BeaconSignal* signal, uint32_t index, uint64_t now_
         http_answer(signal, connection, 429, now_ms);
         return;
     }
-    memcpy(signal->card_data.data() + static_cast<size_t>(card_index) * BEACON_CARD_MAX_PNG, upload.png,
-           upload.png_size);
+    if (upload.png_size > 0)
+    {
+        memcpy(signal->card_data.data() + static_cast<size_t>(card_index) * BEACON_CARD_MAX_PNG, upload.png,
+               upload.png_size);
+    }
     card->png_size = upload.png_size;
+    card->width = upload.width;
+    card->height = upload.height;
     memcpy(card->title, upload.title, sizeof(card->title));
     card->generation++;
     card->orphan_since_ms = 0;
@@ -1302,7 +1344,11 @@ static void http_request(BeaconSignal* signal, uint32_t index, const BeaconHttpR
         http_answer(signal, connection, 404, now_ms);
         return;
     }
-    if (connection->route.kind == BeaconJoinKind::PAGE)
+    if (connection->route.kind == BeaconJoinKind::NOISE)
+    {
+        http_noise(signal, index, request, now_ms);
+    }
+    else if (connection->route.kind == BeaconJoinKind::PAGE)
     {
         http_page(signal, index, request, now_ms);
     }

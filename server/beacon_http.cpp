@@ -2,6 +2,7 @@
 
 #include "beacon_http.h"
 
+#include "beacon_join_noise.h"
 #include "beacon_join_page.h"
 
 #include <monocypher.h>
@@ -350,6 +351,12 @@ bool beacon_http_join_route(const char* target, BeaconJoinRoute* out)
     {
         return false;
     }
+    const char* noise = target + prefix_size;
+    if (strncmp(noise, "noise.png", 9) == 0 && (noise[9] == '\0' || noise[9] == '?'))
+    {
+        out->kind = BeaconJoinKind::NOISE;
+        return true;
+    }
     const char* room = target + prefix_size;
     for (uint32_t i = 0; i < BEACON_GUEST_ROOM_SIZE; i++)
     {
@@ -530,6 +537,10 @@ bool beacon_card_parse_upload(const uint8_t* body, size_t size, BeaconCardUpload
     memcpy(out->title, title, title_size);
     out->title[title_size] = '\0';
     size_t png_size = size - png_at;
+    if (png_size == 0)
+    {
+        return true;   // only a title: the page shows white noise
+    }
     if (png_size > BEACON_CARD_MAX_PNG ||
         !beacon_png_size(body + png_at, png_size, &out->width, &out->height) || out->width == 0 ||
         out->height == 0 || out->width > BEACON_CARD_MAX_WIDTH || out->height > BEACON_CARD_MAX_HEIGHT)
@@ -595,21 +606,34 @@ size_t beacon_html_escape(const char* text, char* out, size_t capacity)
     return used;
 }
 
-size_t beacon_join_page_render(const char* page_template, const char* title, const char* description,
-                               const char* image_url, const char* page_url, char* out, size_t capacity)
+const uint8_t* beacon_join_noise(size_t* size)
 {
-    // Every value escaped once, up front (the largest: 64 bytes of title, each
-    // an entity of 6, or a URL).
-    char values[4][512];
-    const char* raw[4] = {title, description, image_url, page_url};
-    for (uint32_t i = 0; i < 4; i++)
+    *size = sizeof(BEACON_JOIN_NOISE);
+    return BEACON_JOIN_NOISE;
+}
+
+size_t beacon_join_page_render(const char* page_template, const BeaconJoinPage* page, char* out, size_t capacity)
+{
+    // Every value escaped once, up front (the largest: a description with 64
+    // bytes of title, each an entity of 6, or a URL).
+    constexpr uint32_t VALUES = 6;
+    char values[VALUES][1024];
+    char width[16];
+    char height[16];
+    snprintf(width, sizeof(width), "%u", page->image_width);
+    snprintf(height, sizeof(height), "%u", page->image_height);
+    const char* raw[VALUES] = {page->title, page->description, page->image_url, page->page_url, width, height};
+    for (uint32_t i = 0; i < VALUES; i++)
     {
         if (beacon_html_escape(raw[i], values[i], sizeof(values[i])) == 0 && raw[i][0] != '\0')
         {
             return 0;
         }
     }
-    static const char* const NAMES[4] = {"{{TITLE}}", "{{DESCRIPTION}}", "{{IMAGE}}", "{{URL}}"};
+    // {{IMAGE_WIDTH}} before {{IMAGE}}: the longer name is tried first.
+    static const char* const NAMES[VALUES] = {"{{TITLE}}", "{{DESCRIPTION}}", "{{IMAGE}}", "{{URL}}",
+                                              "{{IMAGE_WIDTH}}", "{{IMAGE_HEIGHT}}"};
+    static const uint32_t ORDER[VALUES] = {4, 5, 0, 1, 2, 3};
     size_t used = 0;
     const char* at = page_template;
     while (*at != '\0')
@@ -617,8 +641,9 @@ size_t beacon_join_page_render(const char* page_template, const char* title, con
         int32_t matched = -1;
         if (at[0] == '{' && at[1] == '{')
         {
-            for (uint32_t i = 0; i < 4; i++)
+            for (uint32_t k = 0; k < VALUES; k++)
             {
+                uint32_t i = ORDER[k];
                 if (strncmp(at, NAMES[i], strlen(NAMES[i])) == 0)
                 {
                     matched = static_cast<int32_t>(i);

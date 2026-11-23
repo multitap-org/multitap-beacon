@@ -84,6 +84,12 @@ if(NOT BEACON_JOIN_PAGE_CLASH EQUAL -1)
     message(FATAL_ERROR "packaging/join/index.html contains the raw string's delimiter")
 endif()
 configure_file(server/beacon_join_page.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/beacon_join_page.h" @ONLY)
+# The white noise a card without a screenshot shows (packaging/join/noise.png).
+set(BEACON_JOIN_NOISE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/packaging/join/noise.png")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${BEACON_JOIN_NOISE_SOURCE}")
+file(READ "${BEACON_JOIN_NOISE_SOURCE}" BEACON_JOIN_NOISE_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," BEACON_JOIN_NOISE_BYTES "${BEACON_JOIN_NOISE_HEX}")
+configure_file(server/beacon_join_noise.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/beacon_join_noise.h" @ONLY)
 
 # --- The server, as a library (the tests use it) plus main.cpp --------------
 add_library(beacon_core STATIC

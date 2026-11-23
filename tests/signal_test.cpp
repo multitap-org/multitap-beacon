@@ -980,7 +980,7 @@ static void test_http_cards()
     std::string page = http_exchange(&h, http_get("GET", std::string("/join/") + room), 0);
     check(page.compare(0, 15, "HTTP/1.1 200 OK") == 0, "the page of an unknown room: 200");
     check(page.find("A piccolo session") != std::string::npos &&
-              page.find("https://beacon.example/status/_site/v1/img/piccolo-icon-256.png") != std::string::npos,
+              page.find("https://beacon.example/join/noise.png") != std::string::npos,
           "a plain card, absolute URLs from Host");
     check(page.find("Content-Type: text/html; charset=utf-8") != std::string::npos &&
               page.find("X-Robots-Tag: noindex") != std::string::npos,
@@ -1020,6 +1020,11 @@ static void test_http_cards()
     check(page.find("<meta property=\"og:title\" content=\"Zelda &lt;DX&gt;\">") != std::string::npos &&
               page.find("https://beacon.example/join/7hqelxhbgx2e3/card.png") != std::string::npos,
           "the page carries the card");
+    check(page.find("Playing Zelda &lt;DX&gt; on piccolo") != std::string::npos, "the description names the game");
+    std::string noise = http_exchange(&h, http_get("GET", "/join/noise.png"), 0);
+    check(noise.compare(0, 15, "HTTP/1.1 200 OK") == 0 && noise.find("Content-Type: image/png") != std::string::npos &&
+              http_body(noise).size() > 1000,
+          "the white noise PNG");
     std::string card = http_exchange(&h, http_get("GET", std::string("/join/") + room + "/card.png"), 0);
     check(card.find("Content-Type: image/png") != std::string::npos && http_body(card) == png,
           "the card's PNG, byte for byte (larger than the send buffer)");

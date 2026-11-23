@@ -12,7 +12,9 @@
 //                                the card's og:title / og:image for chat apps;
 // - GET  /join/<room>/card.png   the card's screenshot;
 // - POST /join/<room>/card       the host puts the card (title + screenshot),
-//                                proving it owns the room with the card key.
+//                                proving it owns the room with the card key;
+// - GET  /join/noise.png         white noise, the picture of a card without a
+//                                screenshot (and of a room with no card).
 // The room is derived from the card key, and the card key from the token:
 //   card key = BLAKE2b-256("multitap guest card v1" || token)   (host side)
 //   room     = base32(BLAKE2b-256("multitap guest room v1" || card key)), 13 chars
@@ -39,6 +41,8 @@ constexpr uint32_t BEACON_CARD_MAX_TITLE = 64;       // bytes of UTF-8
 constexpr uint32_t BEACON_CARD_MAX_PNG = 256 * 1024;
 constexpr uint32_t BEACON_CARD_MAX_WIDTH = 1280;
 constexpr uint32_t BEACON_CARD_MAX_HEIGHT = 960;
+constexpr uint32_t BEACON_NOISE_WIDTH = 480;           // packaging/join/noise.png
+constexpr uint32_t BEACON_NOISE_HEIGHT = 360;
 // An upload's body: the card key, the title's length (1 byte), the title, the PNG.
 constexpr uint32_t BEACON_CARD_MAX_UPLOAD = BEACON_GUEST_CARD_KEY_SIZE + 1 + BEACON_CARD_MAX_TITLE + BEACON_CARD_MAX_PNG;
 
@@ -74,6 +78,7 @@ enum class BeaconJoinKind : uint8_t
     PAGE,       // /join/<room>
     CARD_PNG,   // /join/<room>/card.png
     CARD_PUT,   // /join/<room>/card
+    NOISE,      // /join/noise.png (no room)
 };
 
 struct BeaconJoinRoute
@@ -86,7 +91,7 @@ struct BeaconCardUpload
 {
     uint8_t card_key[BEACON_GUEST_CARD_KEY_SIZE] = {};
     char title[BEACON_CARD_MAX_TITLE + 1] = {};
-    const uint8_t* png = nullptr;               // points into the body
+    const uint8_t* png = nullptr;               // points into the body; nullptr: no screenshot (only a title)
     uint32_t png_size = 0;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -109,18 +114,31 @@ void beacon_guest_meeting_id(const char room[BEACON_GUEST_ROOM_SIZE], BeaconId* 
 bool beacon_png_size(const uint8_t* data, size_t size, uint32_t* width, uint32_t* height);
 
 // A card upload's body: field rules, a title of valid UTF-8 with no control
-// characters, a PNG within the limits.
+// characters, a PNG within the limits, or none (a card with only its title).
 bool beacon_card_parse_upload(const uint8_t* body, size_t size, BeaconCardUpload* out);
 
 // Copies `text` into `out` with & < > " ' as entities. Returns the length,
 // 0 if it doesn't fit (`out` NUL-terminated either way when capacity > 0).
 size_t beacon_html_escape(const char* text, char* out, size_t capacity);
 
-// Fills the join page template: {{TITLE}} (escaped), {{DESCRIPTION}}
-// (escaped), {{IMAGE}} and {{URL}} (absolute URLs, escaped). Returns the
-// length, 0 if it doesn't fit.
-size_t beacon_join_page_render(const char* page_template, const char* title, const char* description,
-                               const char* image_url, const char* page_url, char* out, size_t capacity);
+// What the join page shows (beacon_join_page_render).
+struct BeaconJoinPage
+{
+    const char* title = "";
+    const char* description = "";
+    const char* image_url = "";     // absolute
+    uint32_t    image_width = 0;    // its size (og:image:width / height: WhatsApp wants them)
+    uint32_t    image_height = 0;
+    const char* page_url = "";      // absolute
+};
+
+// Fills the join page template: {{TITLE}}, {{DESCRIPTION}}, {{IMAGE}},
+// {{URL}} (escaped), {{IMAGE_WIDTH}}, {{IMAGE_HEIGHT}}. Returns the length,
+// 0 if it doesn't fit.
+size_t beacon_join_page_render(const char* page_template, const BeaconJoinPage* page, char* out, size_t capacity);
+
+// The white noise PNG (packaging/join/noise.png, compiled in).
+const uint8_t* beacon_join_noise(size_t* size);
 
 // The built-in join page (used when no --join-page file is given).
 const char* beacon_join_page_builtin();

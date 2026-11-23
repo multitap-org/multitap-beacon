@@ -98,6 +98,7 @@ static void test_routes()
           "the card");
     check(beacon_http_join_route("/join/7hqelxhbgx2e3/card", &route) && route.kind == BeaconJoinKind::CARD_PUT,
           "the upload");
+    check(beacon_http_join_route("/join/noise.png", &route) && route.kind == BeaconJoinKind::NOISE, "the white noise");
     const char* bad[] = {"/join/", "/join/7hqelxhbgx2e", "/join/7HQELXHBGX2E3", "/join/7hqelxhbgx2e1",
                          "/join/7hqelxhbgx2e3x", "/join/7hqelxhbgx2e3/card.jpg", "/status/", "/joinx/7hqelxhbgx2e3",
                          "/join/7hqelxhbgx2e3/../x"};
@@ -181,6 +182,8 @@ static void test_cards()
     check(parse_upload(upload("a", png(16, 16, BEACON_CARD_MAX_PNG - 33)), &u), "the largest PNG");
     check(!parse_upload(upload("a", png(16, 16, BEACON_CARD_MAX_PNG - 32)), &u), "a PNG over the limit");
     check(!parse_upload(upload("", image), &u), "an empty title");
+    check(parse_upload(upload("Zelda", ""), &u) && u.png == nullptr && u.png_size == 0 && std::strcmp(u.title, "Zelda") == 0,
+          "only a title (no screenshot)");
     check(!parse_upload(upload(std::string(BEACON_CARD_MAX_TITLE + 1, 'a'), image), &u), "a title over the limit");
     check(!parse_upload(upload("a\nb", image), &u), "a control character in the title");
     check(!parse_upload(upload("a\xc2\x85", image), &u), "a C1 control in the title");
@@ -206,9 +209,14 @@ static void test_page()
     check(beacon_html_escape("aaaaaaaaaaaa&", out, 14) == 0, "an escape that doesn't fit");
 
     std::vector<char> page(48 * 1024);
-    size_t size = beacon_join_page_render(beacon_join_page_builtin(), "<Zelda> & \"Link\"", "desc",
-                                          "https://b.example/join/7hqelxhbgx2e3/card.png",
-                                          "https://b.example/join/7hqelxhbgx2e3", page.data(), page.size());
+    BeaconJoinPage shown;
+    shown.title = "<Zelda> & \"Link\"";
+    shown.description = "desc";
+    shown.image_url = "https://b.example/join/7hqelxhbgx2e3/card.png";
+    shown.image_width = 768;
+    shown.image_height = 672;
+    shown.page_url = "https://b.example/join/7hqelxhbgx2e3";
+    size_t size = beacon_join_page_render(beacon_join_page_builtin(), &shown, page.data(), page.size());
     std::string text(page.data(), size);
     check(size > 0, "the built-in page renders");
     check(text.find("{{") == std::string::npos, "no placeholder is left");
@@ -217,7 +225,17 @@ static void test_page()
     check(text.find("<meta property=\"og:image\" content=\"https://b.example/join/7hqelxhbgx2e3/card.png\">") !=
               std::string::npos,
           "og:image");
-    check(beacon_join_page_render(beacon_join_page_builtin(), "t", "d", "i", "u", page.data(), 100) == 0,
+    check(text.find("<meta property=\"og:image:width\" content=\"768\">") != std::string::npos &&
+              text.find("<meta property=\"og:image:height\" content=\"672\">") != std::string::npos,
+          "og:image's size (WhatsApp)");
+    size_t noise_size = 0;
+    const uint8_t* noise = beacon_join_noise(&noise_size);
+    uint32_t noise_width = 0;
+    uint32_t noise_height = 0;
+    check(beacon_png_size(noise, noise_size, &noise_width, &noise_height) && noise_width == BEACON_NOISE_WIDTH &&
+              noise_height == BEACON_NOISE_HEIGHT,
+          "the white noise PNG is compiled in, at its stated size");
+    check(beacon_join_page_render(beacon_join_page_builtin(), &shown, page.data(), 100) == 0,
           "a page that doesn't fit");
 
     char head[512];
