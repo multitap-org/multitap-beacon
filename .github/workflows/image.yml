@@ -2,7 +2,8 @@
 #   main      -> :latest and :sha-<commit>
 #   tag vX.Y  -> :X.Y (and :X.Y.Z)
 # amd64 and arm64, each built on a native runner (no QEMU), pushed by digest,
-# then joined into one multi-arch tag.
+# then joined into one multi-arch tag. A push to main then waits for approval
+# in the "production" environment and redeploys the stack (Portainer webhook).
 # A new ghcr package starts private: make it public once in the package's
 # settings, or servers need a ghcr login to pull it.
 name: image
@@ -107,3 +108,26 @@ jobs:
 
       - name: Show the result
         run: docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
+
+  # Redeploys the multitap-beacon stack on the Multitap VPS once :latest is
+  # published. Runs in the "production" environment, which has a required
+  # reviewer: the job waits in Actions until Andrés approves it. Portainer's
+  # stack webhook re-pulls the image and recreates the containers. The
+  # webhook URL is the environment's PORTAINER_WEBHOOK secret (the URL is the
+  # credential); without it the job does nothing.
+  deploy:
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions: {}
+    steps:
+      - name: Call the Portainer webhook
+        env:
+          WEBHOOK: ${{ secrets.PORTAINER_WEBHOOK }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "PORTAINER_WEBHOOK is not set: nothing to deploy"
+            exit 0
+          fi
+          curl -fsS -X POST --retry 3 --retry-all-errors --max-time 120 -o /dev/null -w "HTTP %{http_code}\n" "$WEBHOOK"
