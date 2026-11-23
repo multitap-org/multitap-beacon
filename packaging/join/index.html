@@ -38,7 +38,7 @@
   [hidden] { display: none !important; }
 </style>
 </head>
-<body data-site="play">
+<body data-site="play" data-state="{{STATE}}">
 <!-- sites-header (tools/sync-snippets.sh) -->
 <header class="sites-bar">
   <div class="wrap sites-bar-row">
@@ -67,6 +67,10 @@
       and a controller port is free. Nothing to sign up for, and nothing is kept once the session ends.</p>
     <p>If it says it couldn't connect, your network and the host's can't reach each other directly
       (the beacon only introduces you, it never relays the game).</p>
+  </section>
+  <section class="panel bad" id="ended" hidden>
+    <p>Nobody is playing on this link any more: the session ended, or the host made a new link.
+      Ask them for the new one.</p>
   </section>
   <section class="panel bad" id="bad" hidden>
     <p>This link is missing its key (the part after the #). Copy the whole link again.</p>
@@ -99,6 +103,12 @@ function readLink() {
 }
 
 function show() {
+  if (document.body.dataset.state === "ended") {
+    document.getElementById("ok").hidden = true;
+    document.getElementById("bad").hidden = true;
+    document.getElementById("ended").hidden = false;
+    return;
+  }
   const link = readLink();
   document.getElementById("ok").hidden = link === null;
   document.getElementById("bad").hidden = link !== null;

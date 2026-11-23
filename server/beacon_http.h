@@ -130,10 +130,12 @@ struct BeaconJoinPage
     uint32_t    image_width = 0;    // its size (og:image:width / height: WhatsApp wants them)
     uint32_t    image_height = 0;
     const char* page_url = "";      // absolute
+    bool        ended = false;      // the room's host is gone: Game offline, no buttons
 };
 
 // Fills the join page template: {{TITLE}}, {{DESCRIPTION}}, {{IMAGE}},
-// {{URL}} (escaped), {{IMAGE_WIDTH}}, {{IMAGE_HEIGHT}}. Returns the length,
+// {{URL}} (escaped), {{IMAGE_WIDTH}}, {{IMAGE_HEIGHT}}, {{STATE}} ("live" or
+// "ended"). Returns the length,
 // 0 if it doesn't fit.
 size_t beacon_join_page_render(const char* page_template, const BeaconJoinPage* page, char* out, size_t capacity);
 

@@ -616,13 +616,14 @@ size_t beacon_join_page_render(const char* page_template, const BeaconJoinPage* 
 {
     // Every value escaped once, up front (the largest: a description with 64
     // bytes of title, each an entity of 6, or a URL).
-    constexpr uint32_t VALUES = 6;
+    constexpr uint32_t VALUES = 7;
     char values[VALUES][1024];
     char width[16];
     char height[16];
     snprintf(width, sizeof(width), "%u", page->image_width);
     snprintf(height, sizeof(height), "%u", page->image_height);
-    const char* raw[VALUES] = {page->title, page->description, page->image_url, page->page_url, width, height};
+    const char* raw[VALUES] = {page->title, page->description, page->image_url, page->page_url, width, height,
+                               page->ended ? "ended" : "live"};
     for (uint32_t i = 0; i < VALUES; i++)
     {
         if (beacon_html_escape(raw[i], values[i], sizeof(values[i])) == 0 && raw[i][0] != '\0')
@@ -632,8 +633,8 @@ size_t beacon_join_page_render(const char* page_template, const BeaconJoinPage* 
     }
     // {{IMAGE_WIDTH}} before {{IMAGE}}: the longer name is tried first.
     static const char* const NAMES[VALUES] = {"{{TITLE}}", "{{DESCRIPTION}}", "{{IMAGE}}", "{{URL}}",
-                                              "{{IMAGE_WIDTH}}", "{{IMAGE_HEIGHT}}"};
-    static const uint32_t ORDER[VALUES] = {4, 5, 0, 1, 2, 3};
+                                              "{{IMAGE_WIDTH}}", "{{IMAGE_HEIGHT}}", "{{STATE}}"};
+    static const uint32_t ORDER[VALUES] = {4, 5, 0, 1, 2, 3, 6};
     size_t used = 0;
     const char* at = page_template;
     while (*at != '\0')

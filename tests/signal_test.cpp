@@ -979,7 +979,9 @@ static void test_http_cards()
     // Unknown room: the page still opens the app, with a plain card.
     std::string page = http_exchange(&h, http_get("GET", std::string("/join/") + room), 0);
     check(page.compare(0, 15, "HTTP/1.1 200 OK") == 0, "the page of an unknown room: 200");
-    check(page.find("A piccolo session") != std::string::npos &&
+    check(page.find("Game offline") != std::string::npos && page.find("data-state=\"ended\"") != std::string::npos,
+          "a room with no host: Game offline");
+    check(page.find("Game offline") != std::string::npos &&
               page.find("https://beacon.example/join/noise.png") != std::string::npos,
           "a plain card, absolute URLs from Host");
     check(page.find("Content-Type: text/html; charset=utf-8") != std::string::npos &&
@@ -1001,6 +1003,9 @@ static void test_http_cards()
     std::string raw;
     check(read_message(&h, host, &reply, &raw) && reply.type == BeaconSignalingType::JOINED, "the host's guest room");
 
+    page = http_exchange(&h, http_get("GET", std::string("/join/") + room), 0);
+    check(page.find("A piccolo session") != std::string::npos && page.find("data-state=\"live\"") != std::string::npos,
+          "a live room before its card: the plain live page");
     check(http_exchange(&h, card_put(room, other_key, "Zelda", png), 0).compare(0, 12, "HTTP/1.1 403") == 0,
           "another key for this room: 403");
     check(http_exchange(&h, card_put("4ecvcngq5gk2z", other_key, "Zelda", png), 0).compare(0, 12, "HTTP/1.1 404") == 0,
@@ -1052,6 +1057,9 @@ static void test_http_cards()
     h.now += BEACON_CARD_ORPHAN_MS - 1000;
     beacon_signal_tick(&h.signal, h.now);
     check(beacon_signal_card(&h.signal, room) != nullptr, "the card waits for the host's reconnect");
+    page = http_exchange(&h, http_get("GET", std::string("/join/") + room), 0);
+    check(page.find("Game offline") != std::string::npos && page.find("join/noise.png") != std::string::npos,
+          "the host gone: Game offline, even while its card is kept");
     h.now += 2000;
     beacon_signal_tick(&h.signal, h.now);
     check(beacon_signal_card(&h.signal, room) == nullptr && h.signal.stats.cards == 0, "then it's deleted");

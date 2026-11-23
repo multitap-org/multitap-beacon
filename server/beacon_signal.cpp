@@ -1118,6 +1118,20 @@ static void http_page(BeaconSignal* signal, uint32_t index, const BeaconHttpRequ
             shown.image_height = found->height;
         }
     }
+    // The host gone (the session ended, the game closed, or NEW made another
+    // link): say so, whatever card is still kept for a minute (Andrés).
+    BeaconId meeting;
+    beacon_guest_meeting_id(connection->route.room, &meeting);
+    if (!beacon_signal_guest_room_live(signal, &meeting))
+    {
+        shown.ended = true;
+        shown.title = "Game offline";
+        snprintf(description, sizeof(description), "%s",
+                 "This piccolo session ended, or the link is no longer valid. Ask the host for a new one.");
+        snprintf(image, sizeof(image), "%s/join/noise.png", base);
+        shown.image_width = BEACON_NOISE_WIDTH;
+        shown.image_height = BEACON_NOISE_HEIGHT;
+    }
     shown.description = description;
     char* page = reinterpret_cast<char*>(signal->page_data.data() + static_cast<size_t>(slot) * BEACON_HTTP_PAGE_SIZE);
     size_t size = beacon_join_page_render(beacon_join_page_builtin(), &shown, page, BEACON_HTTP_PAGE_SIZE);
